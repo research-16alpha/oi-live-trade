@@ -35,15 +35,8 @@ Thumbs.db
 
 # Sensitive files (don't commit to GitHub)
 credentials.sh
-portfolio.json
 *.plist
 monitor.log
 monitor_error.log
 
-# Sensitive files (don't commit to GitHub)
-credentials.sh
-portfolio.json
-*.plist
-monitor.log
-monitor_error.log
-
+# Note: portfolio.json is included in git (mock portfolio data for Streamlit Cloud dashboard)
