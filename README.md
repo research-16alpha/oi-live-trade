@@ -135,7 +135,9 @@ python test_run.py           # Test connection and query
 python automate_oi_monitor.py  # Start monitoring
 ```
 
-## Auto-Start Scheduler Setup (macOS)
+## Auto-Start Scheduler Setup
+
+### macOS
 
 To automatically start monitoring at 9:15 AM IST on weekdays:
 
