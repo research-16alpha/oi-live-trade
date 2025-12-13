@@ -171,77 +171,209 @@ def main():
     
     summary = portfolio.get_portfolio_summary(current_ltp)
     
+    # Get start date and initial balance
+    start_date_str = portfolio_data.get('created_at', datetime.now().isoformat())
+    try:
+        start_date = datetime.fromisoformat(start_date_str.replace('Z', '+00:00'))
+    except:
+        start_date = datetime.fromisoformat(start_date_str)
+    
     initial_balance = summary['initial_balance']
     current_total = summary['total_value']
+    current_date = datetime.now()
     total_pnl = current_total - initial_balance
     total_pnl_pct = (total_pnl / initial_balance * 100) if initial_balance > 0 else 0
     
     win_ratio, winning_trades, losing_trades = calculate_win_ratio(portfolio_data)
     
+    # Key Metrics Section - Start Date, Start Value, Current Date, Current Value
+    st.markdown("### 🎯 Portfolio Overview")
     col1, col2, col3, col4 = st.columns(4)
     
     with col1:
-        st.metric("Portfolio Value", f"₹{current_total:,.2f}", f"₹{total_pnl:,.2f} ({total_pnl_pct:+.2f}%)")
+        st.markdown(f"""
+        <div style="background-color: #f0f2f6; padding: 1rem; border-radius: 0.5rem; text-align: center;">
+            <div style="font-size: 0.9rem; color: #666; margin-bottom: 0.5rem;">Start Date</div>
+            <div style="font-size: 1.2rem; font-weight: bold; color: #1f77b4;">
+                {start_date.strftime('%d %b %Y')}
+            </div>
+            <div style="font-size: 0.8rem; color: #999; margin-top: 0.3rem;">
+                {start_date.strftime('%I:%M %p')}
+            </div>
+        </div>
+        """, unsafe_allow_html=True)
     
     with col2:
-        st.metric("Cash Balance", f"₹{summary['cash']:,.2f}", f"Position: ₹{summary['position_value']:,.2f}" if summary['position_value'] > 0 else None)
+        st.markdown(f"""
+        <div style="background-color: #f0f2f6; padding: 1rem; border-radius: 0.5rem; text-align: center;">
+            <div style="font-size: 0.9rem; color: #666; margin-bottom: 0.5rem;">Start Portfolio Value</div>
+            <div style="font-size: 1.2rem; font-weight: bold; color: #1f77b4;">
+                ₹{initial_balance:,.2f}
+            </div>
+        </div>
+        """, unsafe_allow_html=True)
     
     with col3:
-        realized_pnl = summary.get('total_pnl', 0)
-        st.metric("Realized P&L", f"₹{realized_pnl:,.2f}", f"{winning_trades}W / {losing_trades}L")
+        st.markdown(f"""
+        <div style="background-color: #e8f5e9; padding: 1rem; border-radius: 0.5rem; text-align: center;">
+            <div style="font-size: 0.9rem; color: #666; margin-bottom: 0.5rem;">Current Date</div>
+            <div style="font-size: 1.2rem; font-weight: bold; color: #2ca02c;">
+                {current_date.strftime('%d %b %Y')}
+            </div>
+            <div style="font-size: 0.8rem; color: #999; margin-top: 0.3rem;">
+                {current_date.strftime('%I:%M %p')}
+            </div>
+        </div>
+        """, unsafe_allow_html=True)
     
     with col4:
-        st.metric("Win Ratio", f"{win_ratio:.1f}%", f"{winning_trades}/{winning_trades + losing_trades}" if (winning_trades + losing_trades) > 0 else "0/0")
+        pnl_color = "#00cc00" if total_pnl >= 0 else "#ff0000"
+        st.markdown(f"""
+        <div style="background-color: #e8f5e9; padding: 1rem; border-radius: 0.5rem; text-align: center;">
+            <div style="font-size: 0.9rem; color: #666; margin-bottom: 0.5rem;">Current Portfolio Value</div>
+            <div style="font-size: 1.2rem; font-weight: bold; color: #2ca02c;">
+                ₹{current_total:,.2f}
+            </div>
+            <div style="font-size: 0.9rem; color: {pnl_color}; margin-top: 0.3rem; font-weight: bold;">
+                {total_pnl:+,.2f} ({total_pnl_pct:+.2f}%)
+            </div>
+        </div>
+        """, unsafe_allow_html=True)
     
     st.divider()
     
-    st.subheader("📊 Portfolio Value Over Time")
+    # Portfolio Value Graph - Historical from Start Date
+    st.markdown("### 📊 Portfolio Value History (Since Start)")
     portfolio_history = calculate_portfolio_history(portfolio_data)
     
     if not portfolio_history.empty:
         fig = go.Figure()
         
+        # Main portfolio value line
         fig.add_trace(go.Scatter(
             x=portfolio_history['timestamp'],
             y=portfolio_history['total_value'],
             mode='lines+markers',
             name='Total Portfolio Value',
             line=dict(color='#1f77b4', width=3),
-            marker=dict(size=8)
+            marker=dict(size=6, color='#1f77b4'),
+            hovertemplate='<b>%{fullData.name}</b><br>' +
+                         'Date: %{x|%d %b %Y %I:%M %p}<br>' +
+                         'Value: ₹%{y:,.2f}<extra></extra>',
+            fill='tozeroy',
+            fillcolor='rgba(31, 119, 180, 0.1)'
         ))
         
+        # Cash balance line
         fig.add_trace(go.Scatter(
             x=portfolio_history['timestamp'],
             y=portfolio_history['balance'],
             mode='lines',
             name='Cash Balance',
-            line=dict(color='#2ca02c', width=2, dash='dash')
+            line=dict(color='#2ca02c', width=2, dash='dash'),
+            hovertemplate='<b>%{fullData.name}</b><br>' +
+                         'Date: %{x|%d %b %Y %I:%M %p}<br>' +
+                         'Value: ₹%{y:,.2f}<extra></extra>'
         ))
         
+        # Initial balance reference line
         fig.add_hline(
             y=initial_balance,
             line_dash="dot",
             line_color="gray",
-            annotation_text=f"Initial: ₹{initial_balance:,.2f}"
+            line_width=2,
+            annotation_text=f"Start Value: ₹{initial_balance:,.2f}",
+            annotation_position="right"
         )
         
+        # Current value annotation
+        if len(portfolio_history) > 0:
+            last_value = portfolio_history['total_value'].iloc[-1]
+            last_time = portfolio_history['timestamp'].iloc[-1]
+            fig.add_annotation(
+                x=last_time,
+                y=last_value,
+                text=f"Current: ₹{last_value:,.2f}",
+                showarrow=True,
+                arrowhead=2,
+                arrowcolor="#2ca02c",
+                bgcolor="white",
+                bordercolor="#2ca02c",
+                borderwidth=2
+            )
+        
         fig.update_layout(
-            title="Portfolio Value Evolution",
-            xaxis_title="Time",
-            yaxis_title="Value (₹)",
+            title={
+                'text': f'Portfolio Value Evolution (Since {start_date.strftime("%d %b %Y")})',
+                'x': 0.5,
+                'xanchor': 'center',
+                'font': {'size': 18}
+            },
+            xaxis_title="Date & Time",
+            yaxis_title="Portfolio Value (₹)",
             hovermode='x unified',
-            height=500,
-            template='plotly_white'
+            height=600,
+            template='plotly_white',
+            legend=dict(
+                orientation="h",
+                yanchor="bottom",
+                y=1.02,
+                xanchor="right",
+                x=1
+            ),
+            margin=dict(l=50, r=50, t=80, b=50)
+        )
+        
+        # Format x-axis to show dates nicely
+        fig.update_xaxes(
+            tickformat='%d %b %Y\n%I:%M %p',
+            tickangle=-45
+        )
+        
+        # Format y-axis to show currency
+        fig.update_yaxes(
+            tickformat=',.0f',
+            tickprefix='₹'
         )
         
         st.plotly_chart(fig, use_container_width=True)
+        
+        # Show time period summary
+        days_running = (current_date - start_date).days
+        hours_running = (current_date - start_date).total_seconds() / 3600
+        st.caption(f"📅 Trading Period: {days_running} days ({hours_running:.1f} hours) | Total P&L: ₹{total_pnl:+,.2f} ({total_pnl_pct:+.2f}%)")
     else:
         st.info("No trading history yet. Start trading to see your portfolio grow!")
+    
+    st.divider()
+    
+    # Additional metrics
+    st.markdown("### 📈 Performance Metrics")
+    col1, col2, col3, col4 = st.columns(4)
+    
+    with col1:
+        st.metric("Cash Balance", f"₹{summary['cash']:,.2f}", f"Position: ₹{summary['position_value']:,.2f}" if summary['position_value'] > 0 else None)
+    
+    with col2:
+        realized_pnl = summary.get('total_pnl', 0)
+        st.metric("Realized P&L", f"₹{realized_pnl:,.2f}", f"{winning_trades}W / {losing_trades}L")
+    
+    with col3:
+        st.metric("Win Ratio", f"{win_ratio:.1f}%", f"{winning_trades}/{winning_trades + losing_trades}" if (winning_trades + losing_trades) > 0 else "0/0")
+    
+    with col4:
+        if open_position and current_ltp:
+            unrealized_pnl = summary['unrealized_pnl']
+            st.metric("Unrealized P&L", f"₹{unrealized_pnl:,.2f}", f"{summary['unrealized_pnl_pct']:+.2f}%")
+        else:
+            st.metric("Unrealized P&L", "₹0.00", "No open position")
+    
+    st.divider()
     
     col1, col2 = st.columns(2)
     
     with col1:
-        st.subheader("📌 Current Position")
+        st.markdown("### 📌 Current Position")
         if open_position:
             entry_price = open_position.get('entry_price', 0)
             entry_time = open_position.get('entry_time', 'Unknown')
@@ -270,7 +402,7 @@ def main():
             st.success("No open position")
     
     with col2:
-        st.subheader("📋 Recent Trades")
+        st.markdown("### 📋 Recent Trades")
         trade_history = portfolio_data.get('trade_history', [])
         
         if trade_history:
@@ -293,7 +425,7 @@ def main():
             st.info("No trades yet")
     
     st.divider()
-    st.subheader("📊 Trading Statistics")
+    st.markdown("### 📊 Trading Statistics")
     
     col1, col2, col3, col4 = st.columns(4)
     
