@@ -35,6 +35,7 @@ Thumbs.db
 
 # Sensitive files (don't commit to GitHub)
 credentials.sh
+credentials.bat
 *.plist
 monitor.log
 monitor_error.log
