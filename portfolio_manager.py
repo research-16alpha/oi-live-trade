@@ -5,6 +5,7 @@ Tracks portfolio balance and executes buy/sell trades.
 
 import json
 import logging
+import subprocess
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, Optional, Tuple
@@ -64,8 +65,92 @@ class PortfolioManager:
         try:
             with open(self.portfolio_file, 'w') as f:
                 json.dump(portfolio, f, indent=2)
+            logger.info("Portfolio saved successfully")
+            
+            # Auto-sync to git for Streamlit Cloud
+            self._sync_to_git()
         except Exception as e:
             logger.error(f"Error saving portfolio: {e}")
+    
+    def _sync_to_git(self):
+        """
+        Automatically commit and push portfolio.json to git for Streamlit Cloud.
+        This runs in the background and doesn't block if git operations fail.
+        """
+        try:
+            portfolio_file = self.portfolio_file.resolve()
+            repo_dir = portfolio_file.parent
+            
+            # Check if we're in a git repository
+            result = subprocess.run(
+                ['git', 'rev-parse', '--git-dir'],
+                cwd=repo_dir,
+                capture_output=True,
+                timeout=2
+            )
+            if result.returncode != 0:
+                logger.debug("Not in a git repository, skipping git sync")
+                return
+            
+            # Check if portfolio.json is tracked
+            result = subprocess.run(
+                ['git', 'ls-files', '--error-unmatch', str(portfolio_file.name)],
+                cwd=repo_dir,
+                capture_output=True,
+                timeout=2
+            )
+            if result.returncode != 0:
+                logger.debug("portfolio.json not tracked in git, skipping sync")
+                return
+            
+            # Check if there are changes
+            result = subprocess.run(
+                ['git', 'diff', '--quiet', str(portfolio_file.name)],
+                cwd=repo_dir,
+                capture_output=True,
+                timeout=2
+            )
+            if result.returncode == 0:
+                logger.debug("No changes to portfolio.json, skipping sync")
+                return
+            
+            # Stage the file
+            subprocess.run(
+                ['git', 'add', str(portfolio_file.name)],
+                cwd=repo_dir,
+                capture_output=True,
+                timeout=2
+            )
+            
+            # Commit
+            commit_message = f"Auto-update portfolio: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+            result = subprocess.run(
+                ['git', 'commit', '-m', commit_message],
+                cwd=repo_dir,
+                capture_output=True,
+                timeout=2
+            )
+            
+            if result.returncode == 0:
+                logger.info("Portfolio committed to git")
+                
+                # Push to remote (non-blocking, runs in background)
+                subprocess.Popen(
+                    ['git', 'push', 'origin', 'main'],
+                    cwd=repo_dir,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL
+                )
+                logger.info("Portfolio push initiated to GitHub (Streamlit will update automatically)")
+            else:
+                logger.debug(f"Git commit failed (may be no changes): {result.stderr.decode()}")
+                
+        except subprocess.TimeoutExpired:
+            logger.warning("Git sync timed out, continuing without sync")
+        except FileNotFoundError:
+            logger.debug("Git not found, skipping auto-sync")
+        except Exception as e:
+            logger.debug(f"Git sync failed (non-critical): {e}")
     
     def get_balance(self) -> float:
         """Get current portfolio balance."""
