@@ -33,3 +33,17 @@ Thumbs.db
 .env
 .env.local
 
+# Sensitive files (don't commit to GitHub)
+credentials.sh
+portfolio.json
+*.plist
+monitor.log
+monitor_error.log
+
+# Sensitive files (don't commit to GitHub)
+credentials.sh
+portfolio.json
+*.plist
+monitor.log
+monitor_error.log
+

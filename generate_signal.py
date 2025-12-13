@@ -10,7 +10,7 @@ import json
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Tuple, Dict, List
+from typing import Tuple, Dict, List, Optional
 
 import numpy as np
 import pandas as pd
@@ -116,40 +116,249 @@ def generate_signals(df: pd.DataFrame, strike_step=DEFAULT_STRIKE_STEP, cooldown
     return call_buy_signals, put_buy_signals
 
 
+def evaluate_exit_condition(
+    df: pd.DataFrame,
+    position_type: str,
+    position_expiry: str,
+    position_strike: float,
+    entry_price: float,
+    entry_snapshot_seq: int,
+    current_snapshot_seq: int,
+    stop_loss_pct: float = DEFAULT_STOP_LOSS_PCT,
+    min_hold_snaps: int = DEFAULT_MIN_HOLD_SNAPS
+) -> Tuple[bool, str, Optional[float]]:
+    """
+    Evaluate exit conditions for an open position based on backtest logic.
+    
+    Exit conditions:
+    1. Stop loss: curr_ltp <= entry_price * (1 - stop_loss_pct)
+    2. Sell signal: (current_snap - entry_snap) >= min_hold_snaps AND 
+                    curr_ltp < prev_ltp AND curr_oi < prev_oi
+    
+    Args:
+        df: Prepared dataframe
+        position_type: "BUY_CALL" or "BUY_PUT"
+        position_expiry: Expiry of position
+        position_strike: Strike of position
+        entry_price: Entry price
+        entry_snapshot_seq: Snapshot sequence when entered
+        current_snapshot_seq: Current snapshot sequence
+        stop_loss_pct: Stop loss percentage (default 0.5 for 50%)
+        min_hold_snaps: Minimum hold snapshots (default 7)
+        
+    Returns:
+        Tuple of (should_exit, reason, current_ltp)
+    """
+    # Check if position exists in current snapshot
+    key = (current_snapshot_seq, position_expiry, position_strike)
+    if key not in df.index:
+        return False, "Position not found in current snapshot", None
+    
+    curr = df.loc[key]
+    
+    # Determine LTP and OI columns based on position type
+    if position_type == "BUY_CALL":
+        ltp_col = "c_LTP"
+        oi_col = "c_OI"
+    elif position_type == "BUY_PUT":
+        ltp_col = "p_LTP"
+        oi_col = "p_OI"
+    else:
+        return False, f"Unknown position type: {position_type}", None
+    
+    curr_ltp = curr[ltp_col]
+    curr_oi = curr[oi_col]
+    
+    # Calculate stop loss price
+    stop_loss_price = entry_price * (1 - stop_loss_pct)
+    
+    # Check stop loss condition
+    if curr_ltp <= stop_loss_price:
+        pnl_pct = ((curr_ltp - entry_price) / entry_price) * 100
+        return True, f"Stop loss: {pnl_pct:.2f}%", curr_ltp
+    
+    # Check minimum hold period
+    snapshots_held = current_snapshot_seq - entry_snapshot_seq
+    if snapshots_held < min_hold_snaps:
+        return False, f"Minimum hold not met ({snapshots_held}/{min_hold_snaps})", curr_ltp
+    
+    # Get previous snapshot data for sell signal check
+    df_r = df.reset_index()
+    snap_list = sorted(df_r["SNAPSHOT_SEQ"].unique())
+    current_idx = snap_list.index(current_snapshot_seq)
+    
+    if current_idx > 0:
+        prev_snapshot_seq = snap_list[current_idx - 1]
+        prev_key = (prev_snapshot_seq, position_expiry, position_strike)
+        
+        if prev_key in df.index:
+            prev = df.loc[prev_key]
+            prev_ltp = prev[ltp_col]
+            prev_oi = prev[oi_col]
+            
+            # Check sell signal condition: curr_ltp < prev_ltp AND curr_oi < prev_oi
+            if curr_ltp < prev_ltp and curr_oi < prev_oi:
+                pnl_pct = ((curr_ltp - entry_price) / entry_price) * 100
+                return True, f"Sell signal: Price and OI falling (P&L: {pnl_pct:.2f}%)", curr_ltp
+        else:
+            # If previous snapshot not found, use current as fallback
+            prev_ltp = curr_ltp
+            prev_oi = curr_oi
+    else:
+        # First snapshot, no previous data
+        return False, "No previous snapshot for comparison", curr_ltp
+    
+    # No exit condition met
+    pnl_pct = ((curr_ltp - entry_price) / entry_price) * 100
+    return False, f"Hold: P&L={pnl_pct:.2f}%, Snapshots={snapshots_held}", curr_ltp
+
+
 # ---------------------------
 # Signal evaluation for latest snapshot sequence
 # ---------------------------
-def evaluate_signal(df: pd.DataFrame, has_open_position: bool = False) -> Dict:
+def evaluate_signal(
+    df: pd.DataFrame, 
+    has_open_position: bool = False, 
+    position_type: Optional[str] = None, 
+    position_expiry: Optional[str] = None, 
+    position_strike: Optional[float] = None,
+    entry_price: Optional[float] = None,
+    entry_snapshot_seq: Optional[int] = None,
+    last_buy_snapshot_seq: Optional[int] = None,
+    cooldown: int = DEFAULT_COOLDOWN
+) -> Dict:
     """
     Evaluate Buy/Sell/No signal using the last 3 snapshots in the dataframe.
-    Returns a dict with signal info. If has_open_position=True, we skip new signals.
+    Returns a dict with signal info.
+    
+    Args:
+        df: Prepared dataframe
+        has_open_position: Whether there's an open position
+        position_type: Type of open position ("BUY_CALL" or "BUY_PUT")
+        position_expiry: Expiry of open position
+        position_strike: Strike of open position
     """
-    if has_open_position:
-        return {"signal": "NO_SIGNAL", "reason": "Position already open"}
-
     # Ensure we have at least 3 snapshot sequences
     snap_seqs = sorted(df.reset_index()["SNAPSHOT_SEQ"].unique())
     if len(snap_seqs) < 3:
         return {"signal": "NO_SIGNAL", "reason": "Less than 3 snapshot sequences"}
 
-    call_sigs, put_sigs = generate_signals(df)
     latest_seq = snap_seqs[-1]
+    
+    # If there's an open position, check for exit conditions
+    if has_open_position and position_type and position_expiry and position_strike and entry_price is not None and entry_snapshot_seq is not None:
+        should_exit, exit_reason, current_ltp = evaluate_exit_condition(
+            df,
+            position_type,
+            position_expiry,
+            position_strike,
+            entry_price,
+            entry_snapshot_seq,
+            latest_seq
+        )
+        
+        if should_exit:
+            # Get snapshot ID
+            try:
+                key = (latest_seq, position_expiry, position_strike)
+                if key in df.index:
+                    row = df.loc[key]
+                    snapshot_id = row.get("SNAPSHOT_ID", None)
+                else:
+                    df_r = df.reset_index()
+                    row = df_r[(df_r["SNAPSHOT_SEQ"] == latest_seq) & 
+                               (df_r["EXPIRY"] == position_expiry) & 
+                               (df_r["STRIKE"] == position_strike)]
+                    snapshot_id = row.iloc[0].get("SNAPSHOT_ID", None) if not row.empty else None
+            except Exception:
+                snapshot_id = None
+            
+            signal_type = "SELL_CALL" if position_type == "BUY_CALL" else "SELL_PUT"
+            return {
+                "signal": signal_type,
+                "snapshot_seq": latest_seq,
+                "expiry": position_expiry,
+                "strike": position_strike,
+                "ltp": current_ltp,
+                "snapshot_id": snapshot_id,
+                "reason": exit_reason
+            }
+        else:
+            return {"signal": "NO_SIGNAL", "reason": exit_reason}
+    
+    # If no open position, check for buy signals
+    if has_open_position:
+        return {"signal": "NO_SIGNAL", "reason": "Position already open"}
+
+    # Check cooldown from last buy snapshot
+    if last_buy_snapshot_seq is not None:
+        snapshots_since_last_buy = latest_seq - last_buy_snapshot_seq
+        if snapshots_since_last_buy <= cooldown:
+            return {"signal": "NO_SIGNAL", "reason": f"Cooldown active: {snapshots_since_last_buy}/{cooldown} snapshots since last buy"}
+
+    call_sigs, put_sigs = generate_signals(df)
 
     if latest_seq in call_sigs:
         exp, strike = call_sigs[latest_seq]
+        # Get LTP from latest snapshot
+        try:
+            key = (latest_seq, exp, strike)
+            if key in df.index:
+                row = df.loc[key]
+                ltp = row["c_LTP"]
+                snapshot_id = row.get("SNAPSHOT_ID", None)
+            else:
+                # Fallback: get from reset index
+                df_r = df.reset_index()
+                row = df_r[(df_r["SNAPSHOT_SEQ"] == latest_seq) & (df_r["EXPIRY"] == exp) & (df_r["STRIKE"] == strike)]
+                if not row.empty:
+                    ltp = row.iloc[0]["c_LTP"]
+                    snapshot_id = row.iloc[0].get("SNAPSHOT_ID", None)
+                else:
+                    ltp = None
+                    snapshot_id = None
+        except Exception as e:
+            ltp = None
+            snapshot_id = None
+        
         return {
             "signal": "BUY_CALL",
             "snapshot_seq": latest_seq,
             "expiry": exp,
             "strike": strike,
+            "ltp": ltp,
+            "snapshot_id": snapshot_id,
         }
     if latest_seq in put_sigs:
         exp, strike = put_sigs[latest_seq]
+        # Get LTP from latest snapshot
+        try:
+            key = (latest_seq, exp, strike)
+            if key in df.index:
+                row = df.loc[key]
+                ltp = row["p_LTP"]
+                snapshot_id = row.get("SNAPSHOT_ID", None)
+            else:
+                # Fallback: get from reset index
+                df_r = df.reset_index()
+                row = df_r[(df_r["SNAPSHOT_SEQ"] == latest_seq) & (df_r["EXPIRY"] == exp) & (df_r["STRIKE"] == strike)]
+                if not row.empty:
+                    ltp = row.iloc[0]["p_LTP"]
+                    snapshot_id = row.iloc[0].get("SNAPSHOT_ID", None)
+                else:
+                    ltp = None
+                    snapshot_id = None
+        except Exception as e:
+            ltp = None
+            snapshot_id = None
+        
         return {
             "signal": "BUY_PUT",
             "snapshot_seq": latest_seq,
             "expiry": exp,
             "strike": strike,
+            "ltp": ltp,
+            "snapshot_id": snapshot_id,
         }
     return {"signal": "NO_SIGNAL", "reason": "No call/put trigger on latest snapshot"}
 
@@ -167,6 +376,43 @@ def latest_output_file(output_dir: Path) -> Path:
 def load_csv(path: Path) -> pd.DataFrame:
     df = pd.read_csv(path)
     return df
+
+
+def get_current_ltp(df: pd.DataFrame, expiry: str, strike: float, signal_type: str, snapshot_seq: Optional[int] = None) -> Optional[float]:
+    """
+    Get current LTP for a given expiry, strike, and signal type from the latest snapshot.
+    
+    Args:
+        df: Prepared dataframe
+        expiry: Expiry date
+        strike: Strike price
+        signal_type: "BUY_CALL" or "BUY_PUT"
+        snapshot_seq: Optional snapshot sequence (uses latest if not provided)
+        
+    Returns:
+        Current LTP or None if not found
+    """
+    df_r = df.reset_index()
+    
+    if snapshot_seq is None:
+        snap_seqs = sorted(df_r["SNAPSHOT_SEQ"].unique())
+        if not snap_seqs:
+            return None
+        snapshot_seq = snap_seqs[-1]
+    
+    row = df_r[(df_r["SNAPSHOT_SEQ"] == snapshot_seq) & 
+               (df_r["EXPIRY"] == expiry) & 
+               (df_r["STRIKE"] == strike)]
+    
+    if row.empty:
+        return None
+    
+    if signal_type == "BUY_CALL":
+        return row.iloc[0].get("c_LTP")
+    elif signal_type == "BUY_PUT":
+        return row.iloc[0].get("p_LTP")
+    
+    return None
 
 
 # ---------------------------

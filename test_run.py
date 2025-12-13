@@ -142,6 +142,138 @@ def test_save_results_last_three(monitor: OptionChainMonitor, snapshot_ids: list
         traceback.print_exc()
         return False
 
+
+def test_portfolio_and_signals(monitor: OptionChainMonitor, snapshot_ids: list):
+    """Test portfolio integration with signal generation and trading."""
+    print("\n" + "=" * 60)
+    print("TEST 6: Portfolio Integration & Signal Trading")
+    print("=" * 60)
+    
+    try:
+        from portfolio_manager import PortfolioManager
+        from generate_signal import load_csv, prepare_data, evaluate_signal, get_current_ltp
+        from pathlib import Path
+        
+        # Initialize portfolio manager
+        portfolio = PortfolioManager()
+        summary = portfolio.get_portfolio_summary()
+        print(f"Portfolio Value: {summary['total_value']:.2f} (Cash: {summary['cash']:.2f}, Position: {summary['position_value']:.2f})")
+        print(f"Open Position: {summary['open_position']}")
+        
+        # Get latest CSV file
+        output_dir = Path("output")
+        csv_files = sorted(output_dir.glob("snapshot_*.csv"), key=lambda p: p.stat().st_mtime, reverse=True)
+        if not csv_files:
+            print("✗ No CSV files found for signal generation")
+            return False
+        
+        csv_path = csv_files[0]
+        print(f"Using CSV file: {csv_path}")
+        
+        # Load and prepare data
+        df_raw = load_csv(csv_path)
+        df_prep = prepare_data(df_raw)
+        
+        # Evaluate signal (handles both buy and sell signals)
+        has_open = portfolio.has_open_position()
+        open_position = portfolio.get_open_position()
+        last_buy_snapshot_seq = portfolio.get_last_buy_snapshot_seq()
+        
+        if open_position:
+            # Get current LTP for portfolio value calculation
+            from generate_signal import get_current_ltp
+            current_ltp = get_current_ltp(
+                df_prep,
+                open_position['expiry'],
+                open_position['strike'],
+                open_position['type']
+            )
+            if current_ltp:
+                summary = portfolio.get_portfolio_summary(current_ltp)
+                print(f"\nPortfolio Value: {summary['total_value']:.2f} (Cash: {summary['cash']:.2f}, Position: {summary['position_value']:.2f}, Unrealized P&L: {summary['unrealized_pnl']:.2f} ({summary['unrealized_pnl_pct']:.2f}%))")
+            
+            # Evaluate exit conditions for open position
+            signal_result = evaluate_signal(
+                df_prep,
+                has_open_position=True,
+                position_type=open_position['type'],
+                position_expiry=open_position['expiry'],
+                position_strike=open_position['strike'],
+                entry_price=open_position['entry_price'],
+                entry_snapshot_seq=open_position.get('snapshot_seq', 0)
+            )
+        else:
+            # Evaluate buy signals
+            signal_result = evaluate_signal(
+                df_prep, 
+                has_open_position=False,
+                last_buy_snapshot_seq=last_buy_snapshot_seq
+            )
+        
+        print(f"\nSignal Result: {signal_result['signal']}")
+        if signal_result.get('reason'):
+            print(f"Reason: {signal_result['reason']}")
+        
+        # Execute trade based on signal
+        if signal_result['signal'] in ['SELL_CALL', 'SELL_PUT']:
+            ltp = signal_result.get('ltp')
+            if ltp:
+                # Get current snapshot_seq
+                snap_seqs = sorted(df_prep.reset_index()["SNAPSHOT_SEQ"].unique())
+                current_snapshot_seq = snap_seqs[-1] if snap_seqs else 0
+                
+                success, message = portfolio.sell(
+                    ltp,
+                    snapshot_ids[0] if snapshot_ids else 0,
+                    current_snapshot_seq
+                )
+                if success:
+                    print(f"✓ {message}")
+                    summary = portfolio.get_portfolio_summary()
+                    print(f"Portfolio Value: {summary['total_value']:.2f} (Cash: {summary['cash']:.2f})")
+                    return True
+                else:
+                    print(f"✗ {message}")
+                    return False
+            else:
+                print("✗ LTP not available in signal result")
+                return False
+        elif signal_result['signal'] in ['BUY_CALL', 'BUY_PUT']:
+            ltp = signal_result.get('ltp')
+            if ltp is None:
+                print("✗ LTP not available in signal result")
+                return False
+            
+            success, message = portfolio.buy(
+                signal_result['signal'],
+                signal_result['expiry'],
+                signal_result['strike'],
+                ltp,
+                signal_result.get('snapshot_id', snapshot_ids[0] if snapshot_ids else 0),
+                signal_result.get('snapshot_seq', 0)
+            )
+            
+            if success:
+                print(f"✓ {message}")
+                summary = portfolio.get_portfolio_summary()
+                print(f"Portfolio Value: {summary['total_value']:.2f} (Cash: {summary['cash']:.2f}, Position: {summary['position_value']:.2f})")
+                return True
+            else:
+                print(f"✗ {message}")
+                return False
+        elif signal_result['signal'] == 'NO_SIGNAL':
+            print("No trading signal generated")
+            return True
+        else:
+            print(f"Unknown signal type: {signal_result['signal']}")
+            return False
+            
+    except Exception as e:
+        print(f"✗ Error in portfolio test: {e}")
+        import traceback
+        traceback.print_exc()
+        return False
+
 def main():
     """Run all tests."""
     print("\n" + "=" * 60)
@@ -178,7 +310,8 @@ def main():
         'latest_snapshot': False,
         'snapshot_ids': False,
         'query': False,
-        'save': False
+        'save': False,
+        'portfolio': False
     }
     
     # Test 1: Connection
@@ -213,15 +346,18 @@ def main():
         if test_query_execution(monitor, latest_snapshot):
             results['query'] = True
     
-    # Test 5A: Save latest snapshot only
-    if latest_snapshot:
-        if test_save_results(monitor, latest_snapshot):
-            results['save'] = True
-
-    # Test 5B: Save combined last 3 snapshots (if available)
+    # Test 5: Save combined last 3 snapshots (if available)
     combined_saved = False
     if snapshot_ids:
         combined_saved = test_save_results_last_three(monitor, snapshot_ids)
+        if combined_saved:
+            results['save'] = True
+    
+    # Test 6: Portfolio integration and signal trading
+    portfolio_test = False
+    if snapshot_ids:
+        portfolio_test = test_portfolio_and_signals(monitor, snapshot_ids)
+        results['portfolio'] = portfolio_test
     
     # Summary
     print("\n" + "=" * 60)
@@ -232,6 +368,7 @@ def main():
     print(f"Multiple Snapshots:      {'✓ PASS' if results['snapshot_ids'] else '✗ FAIL'}")
     print(f"Query Execution:         {'✓ PASS' if results['query'] else '✗ FAIL'}")
     print(f"Save to CSV:             {'✓ PASS' if results['save'] else '✗ FAIL'}")
+    print(f"Portfolio & Signals:     {'✓ PASS' if results['portfolio'] else '✗ FAIL'}")
     
     all_passed = all(results.values())
     if all_passed:

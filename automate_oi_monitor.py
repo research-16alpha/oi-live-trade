@@ -5,9 +5,16 @@ Monitors MySQL or SQL Server for new snapshots and extracts data when changes ar
 
 import time
 import logging
-from datetime import datetime
+from datetime import datetime, time as dt_time
 from typing import Optional, List, Dict
 from pathlib import Path
+
+# Import timezone handling
+try:
+    import pytz
+    HAS_PYTZ = True
+except ImportError:
+    HAS_PYTZ = False
 
 # Import database connectors conditionally
 try:
@@ -32,6 +39,69 @@ logging.basicConfig(
     ]
 )
 logger = logging.getLogger(__name__)
+
+# Trading hours configuration
+TRADING_START_TIME = dt_time(9, 15)   # 9:15 AM IST
+TRADING_END_TIME = dt_time(15, 29)     # 3:29 PM IST (last minute of trading)
+TRADING_STOP_TIME = dt_time(15, 30)    # 3:30 PM IST (stop monitoring after this)
+IST_TIMEZONE = 'Asia/Kolkata'
+
+
+def get_ist_timezone():
+    """Get IST timezone object."""
+    if HAS_PYTZ:
+        return pytz.timezone(IST_TIMEZONE)
+    else:
+        # Fallback: Use UTC offset (not ideal, but works)
+        from datetime import timedelta, timezone
+        return timezone(timedelta(hours=5, minutes=30))
+
+
+def check_pytz_installed():
+    """Check if pytz is installed and log warning if not."""
+    if not HAS_PYTZ:
+        logger.warning("pytz not installed. Timezone handling may be inaccurate. Install with: pip install pytz")
+
+
+def get_ist_now():
+    """Get current time in IST."""
+    if HAS_PYTZ:
+        return datetime.now(pytz.timezone(IST_TIMEZONE))
+    else:
+        from datetime import timedelta, timezone
+        ist = timezone(timedelta(hours=5, minutes=30))
+        return datetime.now(ist)
+
+
+def is_trading_day():
+    """Check if today is a trading day (Monday-Friday)."""
+    ist_now = get_ist_now()
+    weekday = ist_now.weekday()  # 0=Monday, 6=Sunday
+    return weekday < 5  # Monday to Friday (0-4)
+
+
+def is_trading_time():
+    """Check if current time is within trading hours (9:15 AM - 3:29 PM IST, Mon-Fri)."""
+    if not is_trading_day():
+        return False
+    
+    ist_now = get_ist_now()
+    current_time = ist_now.time()
+    # Trading hours: 9:15 AM to 3:29 PM (inclusive of 3:29:00)
+    # Include 3:29:00 PM but exclude anything after
+    return TRADING_START_TIME <= current_time <= TRADING_END_TIME
+
+
+def should_stop_trading():
+    """Check if we should stop trading (after 3:29 PM IST, i.e., at or after 3:30 PM)."""
+    if not is_trading_day():
+        return True  # Stop on weekends
+    
+    ist_now = get_ist_now()
+    current_time = ist_now.time()
+    # Stop if current time is at or after 3:30 PM
+    # This allows trading until 3:29:59 PM, then stops at 3:30:00 PM
+    return current_time >= TRADING_STOP_TIME
 
 
 class OptionChainMonitor:
@@ -408,27 +478,188 @@ ORDER BY SNAPSHOT_ID, STRIKE
     
     def process_snapshots(self, snapshot_ids: List[int]):
         """
-        Process multiple snapshots and save their data in a single file.
+        Process multiple snapshots and save their data in a single combined file.
+        Always processes all provided snapshots together - never saves individual snapshots.
         """
         if not snapshot_ids:
             logger.warning("No snapshot IDs provided to process.")
             return
         logger.info(f"Processing snapshots (combined): {snapshot_ids}")
+        # Always combine multiple snapshots - never save individual snapshots
         results = self.execute_query_for_snapshots(snapshot_ids)
         if results:
             # use the most recent snapshot id for filename reference
             latest_id = snapshot_ids[0]
             self.save_results(results, latest_id)
+            
+            # Process signals and execute trades
+            self.process_signals_and_trades(snapshot_ids, latest_id)
+    
+    def process_signals_and_trades(self, snapshot_ids: List[int], latest_snapshot_id: int):
+        """
+        Generate signals from the latest CSV and execute trades via portfolio manager.
+        """
+        try:
+            from portfolio_manager import PortfolioManager
+            from generate_signal import latest_output_file, load_csv, prepare_data, evaluate_signal, get_current_ltp
+            from pathlib import Path
+            
+            # Initialize portfolio manager
+            portfolio = PortfolioManager()
+            
+            # Get the latest CSV file (should be the one we just saved)
+            output_dir = Path('output')
+            csv_path = latest_output_file(output_dir)
+            
+            logger.info(f"Processing signals from: {csv_path}")
+            
+            # Log initial portfolio value
+            summary = portfolio.get_portfolio_summary()
+            logger.info(f"Portfolio Value: {summary['total_value']:.2f} (Cash: {summary['cash']:.2f})")
+            
+            # Load and prepare data
+            df_raw = load_csv(csv_path)
+            df_prep = prepare_data(df_raw)
+            
+            # Check for open position - if exists, evaluate exit conditions
+            open_position = portfolio.get_open_position()
+            current_ltp = None
+            if open_position:
+                logger.info(f"Open position: {open_position['type']} {open_position['expiry']} {open_position['strike']}")
+                
+                # Get current LTP for portfolio value calculation
+                current_ltp = get_current_ltp(
+                    df_prep,
+                    open_position['expiry'],
+                    open_position['strike'],
+                    open_position['type']
+                )
+                
+                # Get current snapshot_seq from dataframe (latest snapshot)
+                snap_seqs = sorted(df_prep.reset_index()["SNAPSHOT_SEQ"].unique())
+                current_snapshot_seq = snap_seqs[-1] if snap_seqs else open_position.get('snapshot_seq', 0)
+                
+                # Evaluate exit conditions using the backtest logic
+                signal_result = evaluate_signal(
+                    df_prep,
+                    has_open_position=True,
+                    position_type=open_position['type'],
+                    position_expiry=open_position['expiry'],
+                    position_strike=open_position['strike'],
+                    entry_price=open_position['entry_price'],
+                    entry_snapshot_seq=open_position.get('snapshot_seq', 0)
+                )
+                
+                # Log portfolio value (cash + position value)
+                if current_ltp:
+                    summary = portfolio.get_portfolio_summary(current_ltp)
+                    logger.info(f"Portfolio Value: Cash={summary['cash']:.2f}, Position={summary['position_value']:.2f}, Total={summary['total_value']:.2f} (Unrealized P&L: {summary['unrealized_pnl']:.2f} ({summary['unrealized_pnl_pct']:.2f}%))")
+                
+                # If sell signal is generated, execute the trade
+                if signal_result['signal'] in ['SELL_CALL', 'SELL_PUT']:
+                    ltp = signal_result.get('ltp')
+                    if ltp:
+                        success, message = portfolio.sell(
+                            ltp,
+                            latest_snapshot_id,
+                            current_snapshot_seq
+                        )
+                        if success:
+                            logger.info(f"SELL executed: {signal_result.get('reason', 'Exit condition met')} - {message}")
+                            # Log portfolio value after sell
+                            summary = portfolio.get_portfolio_summary()
+                            logger.info(f"Portfolio Value: {summary['total_value']:.2f} (Cash: {summary['cash']:.2f})")
+                        else:
+                            logger.warning(f"SELL failed: {message}")
+                    else:
+                        logger.warning(f"SELL signal generated but LTP not available")
+                else:
+                    # No exit condition met
+                    logger.debug(f"Position held: {signal_result.get('reason', 'No exit condition')}")
+            
+            # Evaluate new buy signals (only if no open position)
+            if not portfolio.has_open_position():
+                # Get last buy snapshot for cooldown check
+                last_buy_snapshot_seq = portfolio.get_last_buy_snapshot_seq()
+                signal_result = evaluate_signal(
+                    df_prep, 
+                    has_open_position=False,
+                    last_buy_snapshot_seq=last_buy_snapshot_seq
+                )
+                
+                if signal_result['signal'] in ['BUY_CALL', 'BUY_PUT']:
+                    ltp = signal_result.get('ltp')
+                    if ltp:
+                        # Get current snapshot_seq for the buy
+                        snap_seqs = sorted(df_prep.reset_index()["SNAPSHOT_SEQ"].unique())
+                        current_snapshot_seq = snap_seqs[-1] if snap_seqs else 0
+                        
+                        success, message = portfolio.buy(
+                            signal_result['signal'],
+                            signal_result['expiry'],
+                            signal_result['strike'],
+                            ltp,
+                            latest_snapshot_id,
+                            signal_result.get('snapshot_seq', current_snapshot_seq)
+                        )
+                        if success:
+                            logger.info(f"BUY executed: {message}")
+                            # Log portfolio value after buy (cash only, position value will be logged next cycle)
+                            summary = portfolio.get_portfolio_summary()
+                            logger.info(f"Portfolio Value: {summary['total_value']:.2f} (Cash: {summary['cash']:.2f}, Position: {summary['position_value']:.2f})")
+                        else:
+                            logger.warning(f"BUY failed: {message}")
+                    else:
+                        logger.warning(f"BUY signal generated but LTP not available")
+                elif signal_result['signal'] == 'NO_SIGNAL':
+                    logger.debug(f"No signal: {signal_result.get('reason', 'Unknown')}")
+                    # Log portfolio value even when no signal
+                    summary = portfolio.get_portfolio_summary()
+                    logger.info(f"Portfolio Value: {summary['total_value']:.2f} (Cash: {summary['cash']:.2f})")
+            else:
+                logger.debug("Skipping buy signal evaluation - position already open")
+                
+        except ImportError as e:
+            logger.warning(f"Portfolio/signal modules not available: {e}")
+        except Exception as e:
+            logger.error(f"Error processing signals and trades: {e}", exc_info=True)
     
     def run(self, check_interval: int = 60):
         """
-        Main monitoring loop.
+        Main monitoring loop with trading hours enforcement.
         
         Args:
             check_interval: Time in seconds between checks (default: 60 seconds)
         """
+        check_pytz_installed()
+        
+        ist_now = get_ist_now()
         logger.info(f"Starting Option Chain Monitor for {self.ticker}")
+        logger.info(f"Current IST time: {ist_now.strftime('%Y-%m-%d %H:%M:%S %Z')}")
         logger.info(f"Check interval: {check_interval} seconds")
+        logger.info(f"Trading hours: {TRADING_START_TIME.strftime('%H:%M')} - {TRADING_END_TIME.strftime('%H:%M')} IST (Monday-Friday)")
+        logger.info(f"Monitor will stop after {TRADING_END_TIME.strftime('%H:%M')} IST (at {TRADING_STOP_TIME.strftime('%H:%M')} IST)")
+        
+        # Check if trading hours
+        if not is_trading_time():
+            ist_now = get_ist_now()
+            if not is_trading_day():
+                logger.warning(f"Outside trading days. Current day: {ist_now.strftime('%A')}")
+            else:
+                logger.warning(f"Outside trading hours. Current time: {ist_now.strftime('%H:%M:%S %Z')}")
+            logger.info("Exiting. Will start again at 9:15 AM IST on next trading day.")
+            return
+        
+        # Check for open positions from previous session
+        try:
+            from portfolio_manager import PortfolioManager
+            portfolio = PortfolioManager()
+            open_position = portfolio.get_open_position()
+            if open_position:
+                logger.info(f"Resuming with open position: {open_position['type']} {open_position['expiry']} {open_position['strike']}")
+                logger.info(f"Position entered: {open_position.get('entry_time', 'Unknown')}")
+        except Exception as e:
+            logger.debug(f"Could not check portfolio: {e}")
         
         # Initialize with current latest snapshot
         self.last_snapshot_id = self.get_latest_snapshot_id()
@@ -439,6 +670,30 @@ ORDER BY SNAPSHOT_ID, STRIKE
         
         try:
             while True:
+                # Check if still in trading hours
+                if not is_trading_time():
+                    ist_now = get_ist_now()
+                    if should_stop_trading():
+                        logger.info(f"Market close time reached (after 3:29 PM IST). Current time: {ist_now.strftime('%H:%M:%S %Z')}")
+                        
+                        # Check if there's an open position to carry forward (no forced sells)
+                        try:
+                            from portfolio_manager import PortfolioManager
+                            portfolio = PortfolioManager()
+                            open_position = portfolio.get_open_position()
+                            if open_position:
+                                logger.info(f"Carrying forward open position: {open_position['type']} {open_position['expiry']} {open_position['strike']}")
+                                logger.info(f"Position entered at: {open_position.get('entry_time', 'Unknown')}")
+                                logger.info(f"Position will be monitored when trading resumes next day at 9:15 AM IST.")
+                        except Exception:
+                            pass
+                        
+                        logger.info("Stopping monitor. Will resume at 9:15 AM IST on next trading day (Monday-Friday).")
+                        break
+                    else:
+                        logger.info(f"Outside trading hours. Current time: {ist_now.strftime('%H:%M:%S %Z')}")
+                        logger.info("Stopping monitor. Will resume at 9:15 AM IST on next trading day.")
+                        break
                 # Check for new snapshot
                 current_snapshot_id = self.get_latest_snapshot_id()
                 
