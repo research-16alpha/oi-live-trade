@@ -42,16 +42,63 @@ def prepare_data(df: pd.DataFrame) -> pd.DataFrame:
     df["TIMESTAMP"] = pd.to_datetime(
         df["DOWNLOAD_DATE"].astype(str) + " " + df["DOWNLOAD_TIME"].astype(str)
     )
-    df = df.sort_values(["DOWNLOAD_DATE", "SNAPSHOT_ID", "STRIKE"]).reset_index(drop=True)
+    # Sort by TIMESTAMP to ensure chronological order (not SNAPSHOT_ID)
+    df = df.sort_values(["TIMESTAMP", "STRIKE"]).reset_index(drop=True)
 
-    snap_keys = df[["DOWNLOAD_DATE", "SNAPSHOT_ID"]].drop_duplicates().reset_index(drop=True)
+    # Create snapshot sequence based on chronological order
+    snap_keys = df[["DOWNLOAD_DATE", "SNAPSHOT_ID", "TIMESTAMP"]].drop_duplicates().reset_index(drop=True)
+    snap_keys = snap_keys.sort_values("TIMESTAMP").reset_index(drop=True)
     snap_keys["SNAPSHOT_SEQ"] = range(len(snap_keys))
-    df = df.merge(snap_keys, on=["DOWNLOAD_DATE", "SNAPSHOT_ID"], how="left")
+    df = df.merge(snap_keys[["DOWNLOAD_DATE", "SNAPSHOT_ID", "SNAPSHOT_SEQ"]],
+                  on=["DOWNLOAD_DATE", "SNAPSHOT_ID"], how="left")
 
     df["STRIKE"] = df["STRIKE"].astype(float)
     df["EXPIRY"] = df["EXPIRY"].astype(str)
     df = df.set_index(["SNAPSHOT_SEQ", "EXPIRY", "STRIKE"]).sort_index()
     return df
+
+
+def aggregate_to_3min_snapshots(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Aggregate high-frequency snapshots into 3-minute synthetic snapshots.
+    This recreates the original 3-minute interval structure your strategy was built on.
+    Groups snapshots into 3-minute windows and takes the last row in each window.
+    """
+    required_cols = [
+        "DOWNLOAD_DATE", "DOWNLOAD_TIME", "SNAPSHOT_ID",
+        "EXPIRY", "STRIKE", "c_OI", "c_LTP", "p_OI", "p_LTP", "UNDERLYING_VALUE",
+        "c_CHNG_IN_OI", "c_VOLUME", "p_CHNG_IN_OI", "p_VOLUME"
+    ]
+    missing = [c for c in required_cols if c not in df.columns]
+    if missing:
+        raise ValueError(f"Missing columns for aggregation: {missing}")
+
+    df_r = df.copy()
+    df_r["DOWNLOAD_DATE"] = pd.to_datetime(df_r["DOWNLOAD_DATE"]).dt.date
+    df_r["DOWNLOAD_TIME"] = pd.to_datetime(df_r["DOWNLOAD_TIME"], format="%H:%M:%S").dt.time
+    df_r["TIMESTAMP"] = pd.to_datetime(
+        df_r["DOWNLOAD_DATE"].astype(str) + " " + df_r["DOWNLOAD_TIME"].astype(str)
+    )
+
+    # Sort chronologically
+    df_r = df_r.sort_values("TIMESTAMP").reset_index(drop=True)
+
+    # Define 3-minute windows (180 seconds) starting from first timestamp
+    t0 = df_r["TIMESTAMP"].iloc[0]
+    df_r["WINDOW"] = ((df_r["TIMESTAMP"] - t0).dt.total_seconds() // 180).astype(int)
+
+    aggregated_rows = []
+    for window_id in sorted(df_r["WINDOW"].unique()):
+        window_data = df_r[df_r["WINDOW"] == window_id]
+        if window_data.empty:
+            continue
+        # Take the last timestamp in this 3-minute window
+        last_row = window_data.sort_values("TIMESTAMP").iloc[-1]
+        aggregated_rows.append(last_row[required_cols])
+
+    df_agg = pd.DataFrame(aggregated_rows)
+    # Reuse prepare_data to build SNAPSHOT_SEQ and index
+    return prepare_data(df_agg)
 
 
 # ---------------------------
@@ -97,8 +144,8 @@ def generate_signals(df: pd.DataFrame, strike_step=DEFAULT_STRIKE_STEP, cooldown
                 if (
                     underlying_increasing and
                     r2["c_LTP"] > r1["c_LTP"] > r0["c_LTP"] and
-                    r2["c_LTP"] >= r0["c_LTP"] * 1.03 and  # 3% price move
-                    r2["c_OI"] >= r1["c_OI"] * 1.02 and   # 2% OI growth
+                    r2["c_LTP"] >= r0["c_LTP"] * 1.03 and  # 3% price move (original backtest)
+                    r2["c_OI"] >= r1["c_OI"] * 1.05 and   # 5% OI growth (original backtest)
                     r0["c_LTP"] > 5 and
                     t2 - last_call_entry_snap > cooldown
                 ):
@@ -109,8 +156,8 @@ def generate_signals(df: pd.DataFrame, strike_step=DEFAULT_STRIKE_STEP, cooldown
                 if (
                     underlying_decreasing and
                     r2["p_LTP"] > r1["p_LTP"] > r0["p_LTP"] and
-                    r2["p_LTP"] >= r0["p_LTP"] * 1.03 and  # 3% price move
-                    r2["p_OI"] >= r1["p_OI"] * 1.02 and   # 2% OI growth
+                    r2["p_LTP"] >= r0["p_LTP"] * 1.03 and  # 3% price move (original backtest)
+                    r2["p_OI"] >= r1["p_OI"] * 1.05 and   # 5% OI growth (original backtest)
                     r0["p_LTP"] > 5 and
                     t2 - last_put_entry_snap > cooldown
                 ):

@@ -121,10 +121,10 @@ class OptionChainMonitor:
         self.last_snapshot_id: Optional[int] = None
         
         # SQL Server query (uses TOP and ? parameters)
-        # Fetches last 3 snapshots in a single query
+        # Fetches last 12 snapshots in a single query (to build 3-minute aggregates)
         self.query_template_sqlserver = """
 WITH Last3Snapshots AS (
-    SELECT DISTINCT TOP 3 SNAPSHOT_ID
+    SELECT DISTINCT TOP 12 SNAPSHOT_ID
     FROM optionchain_combined
     WHERE TICKER = ?
     ORDER BY SNAPSHOT_ID DESC
@@ -206,14 +206,14 @@ ORDER BY SNAPSHOT_ID, STRIKE
 """
         
         # MySQL query (uses LIMIT and %s parameters, DATEDIFF syntax)
-        # Fetches last 3 snapshots in a single query
+        # Fetches last 12 snapshots in a single query (to build 3-minute aggregates)
         self.query_template_mysql = """
 WITH Last3Snapshots AS (
     SELECT DISTINCT SNAPSHOT_ID
     FROM optionchain_combined
     WHERE TICKER = %s
     ORDER BY SNAPSHOT_ID DESC
-    LIMIT 3
+    LIMIT 12
 ),
 ClosestExpiry AS (
     SELECT
@@ -503,6 +503,61 @@ ORDER BY SNAPSHOT_ID, STRIKE
         
         logger.info(f"Saved {len(results)} rows to {filename}")
     
+    def collect_three_snapshots_timed(self, gap_seconds: int = 180) -> List[int]:
+        """
+        Collect 3 unique snapshot IDs, waiting gap_seconds between fetches.
+        This ensures we get snapshots that are approximately 3 minutes apart.
+        
+        Process:
+        1. Fetch current snapshot (snapshot 1)
+        2. Wait gap_seconds (default 180s = 3 minutes)
+        3. Fetch current snapshot (snapshot 2)
+        4. Wait gap_seconds
+        5. Fetch current snapshot (snapshot 3)
+        6. Return all 3 snapshot IDs
+        
+        Args:
+            gap_seconds: Time to wait between snapshot fetches (default: 180 = 3 minutes)
+            
+        Returns:
+            List of 3 snapshot IDs (most recent first), or empty list if collection fails
+        """
+        snapshots = []
+        attempts = 0
+        max_attempts = 10  # Safety limit to avoid infinite loops
+        
+        logger.info(f"Starting timed collection of 3 snapshots (gap: {gap_seconds}s = {gap_seconds/60:.1f} minutes)")
+        
+        while len(snapshots) < 3 and attempts < max_attempts:
+            sid = self.get_latest_snapshot_id()
+            
+            if sid is None:
+                logger.warning(f"Attempt {attempts + 1}: No snapshot found, will retry after {gap_seconds}s wait")
+            else:
+                # Only add if it's a new snapshot (different from last collected)
+                if not snapshots or sid != snapshots[-1]:
+                    snapshots.append(sid)
+                    logger.info(f"Collected snapshot ID: {sid} ({len(snapshots)}/3)")
+                else:
+                    logger.debug(f"Attempt {attempts + 1}: No new snapshot (still {sid}), will retry after {gap_seconds}s wait")
+            
+            # If we have 3 snapshots, we're done
+            if len(snapshots) >= 3:
+                break
+            
+            # Wait before next fetch (except after the last successful collection)
+            if len(snapshots) < 3:
+                attempts += 1
+                logger.info(f"Waiting {gap_seconds}s before next snapshot fetch...")
+                time.sleep(gap_seconds)
+        
+        if len(snapshots) == 3:
+            logger.info(f"Successfully collected 3 snapshots: {snapshots}")
+            return snapshots
+        else:
+            logger.warning(f"Could not collect 3 snapshots (got {len(snapshots)} after {attempts} attempts). Skipping.")
+            return []
+    
     def process_snapshots(self, snapshot_ids: List[int]):
         """
         Process multiple snapshots and save their data in a single combined file.
@@ -582,7 +637,7 @@ ORDER BY SNAPSHOT_ID, STRIKE
         """
         try:
             from portfolio_manager import PortfolioManager
-            from generate_signal import latest_output_file, load_csv, prepare_data, evaluate_signal, get_current_ltp
+            from generate_signal import latest_output_file, load_csv, prepare_data, evaluate_signal, get_current_ltp, aggregate_to_3min_snapshots
             from pathlib import Path
             
             # Initialize portfolio manager
@@ -598,9 +653,36 @@ ORDER BY SNAPSHOT_ID, STRIKE
             summary = portfolio.get_portfolio_summary()
             logger.info(f"Portfolio Value: {summary['total_value']:.2f} (Cash: {summary['cash']:.2f})")
             
-            # Load and prepare data
+            # Load raw data
             df_raw = load_csv(csv_path)
-            df_prep = prepare_data(df_raw)
+
+            # Decide whether to aggregate to 3-minute snapshots
+            df_tmp = df_raw.copy()
+            from pandas import to_datetime
+            df_tmp["TIMESTAMP"] = to_datetime(
+                df_tmp["DOWNLOAD_DATE"].astype(str) + " " + df_tmp["DOWNLOAD_TIME"].astype(str)
+            )
+            unique_snapshots = df_tmp["SNAPSHOT_ID"].nunique()
+
+            if unique_snapshots > 5:
+                # Aggregate high-frequency snapshots into 3-minute windows
+                df_prep = aggregate_to_3min_snapshots(df_raw)
+                agg_windows = df_prep.reset_index()["SNAPSHOT_SEQ"].nunique()
+                logger.info(f"Aggregated {unique_snapshots} snapshots into {agg_windows} 3-minute windows")
+
+                # Save aggregated snapshots alongside raw CSV
+                try:
+                    agg_output_dir = Path("output")
+                    agg_output_dir.mkdir(exist_ok=True)
+                    agg_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                    agg_filename = agg_output_dir / f"snapshot_agg_{latest_snapshot_id}_{agg_timestamp}.csv"
+                    df_prep.reset_index().to_csv(agg_filename, index=False)
+                    logger.info(f"Saved aggregated 3-minute snapshots to {agg_filename}")
+                except Exception as e:
+                    logger.warning(f"Failed to save aggregated snapshots: {e}")
+            else:
+                # Fallback to direct preparation if few snapshots
+                df_prep = prepare_data(df_raw)
             
             # Check for open position - if exists, evaluate exit conditions
             open_position = portfolio.get_open_position()
@@ -878,17 +960,22 @@ ORDER BY SNAPSHOT_ID, STRIKE
                 if current_snapshot_id != self.last_snapshot_id:
                     logger.info(f"New snapshot detected! Previous: {self.last_snapshot_id}, Current: {current_snapshot_id}")
                     
-                    # Get last 3 snapshots
-                    snapshot_ids = self.get_snapshot_ids(limit=3)
+                    # Collect 3 snapshots with 3-minute gaps between them
+                    # This ensures we get snapshots that are approximately 3 minutes apart
+                    snapshot_ids = self.collect_three_snapshots_timed(gap_seconds=180)
                     
                     if snapshot_ids:
-                        logger.info(f"Processing last {len(snapshot_ids)} snapshots: {snapshot_ids}")
+                        logger.info(f"Collected {len(snapshot_ids)} timed snapshots: {snapshot_ids}")
+                        logger.info("Processing collected snapshots...")
                         self.process_snapshots(snapshot_ids)
                     else:
-                        logger.warning("No snapshots to process")
+                        logger.warning("Timed snapshot collection failed or incomplete. Skipping this cycle.")
                     
-                    # Update last snapshot ID
-                    self.last_snapshot_id = current_snapshot_id
+                    # Update last snapshot ID to the most recent one we collected
+                    if snapshot_ids:
+                        self.last_snapshot_id = snapshot_ids[0]
+                    else:
+                        self.last_snapshot_id = current_snapshot_id
                 else:
                     logger.debug(f"No change detected. Current snapshot: {current_snapshot_id}")
                 
