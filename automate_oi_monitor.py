@@ -124,12 +124,12 @@ class OptionChainMonitor:
         self.query_template_sqlserver = """
 WITH ClosestExpiry AS (
     SELECT
-        os.DOWNLOAD_DATE,
-        os.DOWNLOAD_TIME,
+        oc.DOWNLOAD_DATE,
+        oc.DOWNLOAD_TIME,
         oc.SNAPSHOT_ID,
         oc.EXPIRY,
         oc.STRIKE,
-        os.UNDERLYING_VALUE,
+        oc.UNDERLYING_VALUE,
         oc.c_OI,
         oc.c_CHNG_IN_OI,
         oc.c_LTP,
@@ -140,12 +140,9 @@ WITH ClosestExpiry AS (
         oc.p_VOLUME,
         DENSE_RANK() OVER (
             PARTITION BY oc.SNAPSHOT_ID
-            ORDER BY ABS(DATEDIFF(day, oc.EXPIRY, os.DOWNLOAD_DATE))
+            ORDER BY ABS(DATEDIFF(day, oc.EXPIRY, oc.DOWNLOAD_DATE))
         ) AS expiry_rank
-    FROM optionchain oc
-    JOIN optionchain_snapshots os
-        ON oc.SNAPSHOT_ID = os.SNAPSHOT_ID
-        AND oc.TICKER = os.TICKER
+    FROM optionchain_combined oc
     WHERE oc.TICKER = ?
         AND oc.SNAPSHOT_ID = ?
 ),
@@ -204,12 +201,12 @@ ORDER BY SNAPSHOT_ID, STRIKE
         self.query_template_mysql = """
 WITH ClosestExpiry AS (
     SELECT
-        os.DOWNLOAD_DATE,
-        os.DOWNLOAD_TIME,
+        oc.DOWNLOAD_DATE,
+        oc.DOWNLOAD_TIME,
         oc.SNAPSHOT_ID,
         oc.EXPIRY,
         oc.STRIKE,
-        os.UNDERLYING_VALUE,
+        oc.UNDERLYING_VALUE,
         oc.c_OI,
         oc.c_CHNG_IN_OI,
         oc.c_LTP,
@@ -220,12 +217,9 @@ WITH ClosestExpiry AS (
         oc.p_VOLUME,
         DENSE_RANK() OVER (
             PARTITION BY oc.SNAPSHOT_ID
-            ORDER BY ABS(DATEDIFF(oc.EXPIRY, os.DOWNLOAD_DATE))
+            ORDER BY ABS(DATEDIFF(oc.EXPIRY, oc.DOWNLOAD_DATE))
         ) AS expiry_rank
-    FROM optionchain oc
-    JOIN optionchain_snapshots os
-        ON oc.SNAPSHOT_ID = os.SNAPSHOT_ID
-        AND oc.TICKER = os.TICKER
+    FROM optionchain_combined oc
     WHERE oc.TICKER = %s
         AND oc.SNAPSHOT_ID = %s
 ),
