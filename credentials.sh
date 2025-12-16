@@ -6,10 +6,10 @@
 # Set database type: 'mysql' or 'sqlserver'
 export DB_TYPE="mysql"
 
-export DB_SERVER="34.93.144.87"
-export DB_DATABASE="optionchaindata"
-export DB_USER="lakshay"
-export DB_PASSWORD="16Alpha!"
+export DB_SERVER="192.168.1.164"
+export DB_DATABASE="optionchaindb"
+export DB_USER="gautam"
+export DB_PASSWORD="Gautam1306"
 export DB_PORT="3306"  # 3306 for MySQL, 1433 for SQL Server
 
 echo "Database credentials loaded!"
