@@ -107,13 +107,13 @@ def should_stop_trading():
 class OptionChainMonitor:
     """Monitors option chain snapshots and extracts data when new snapshots are available."""
     
-    def __init__(self, connection_config: Dict, ticker: str = 'NIFTY50'):
+    def __init__(self, connection_config: Dict, ticker: str = 'NIFTY'):
         """
         Initialize the monitor.
         
         Args:
             connection_config: Database connection configuration dictionary
-            ticker: Ticker symbol to monitor (default: 'NIFTY50')
+            ticker: Ticker symbol to monitor (default: 'NIFTY')
         """
         self.config = connection_config
         self.db_type = connection_config['type']
@@ -121,8 +121,15 @@ class OptionChainMonitor:
         self.last_snapshot_id: Optional[int] = None
         
         # SQL Server query (uses TOP and ? parameters)
+        # Fetches last 3 snapshots in a single query
         self.query_template_sqlserver = """
-WITH ClosestExpiry AS (
+WITH Last3Snapshots AS (
+    SELECT DISTINCT TOP 3 SNAPSHOT_ID
+    FROM optionchain_combined
+    WHERE TICKER = ?
+    ORDER BY SNAPSHOT_ID DESC
+),
+ClosestExpiry AS (
     SELECT
         oc.DOWNLOAD_DATE,
         oc.DOWNLOAD_TIME,
@@ -143,8 +150,9 @@ WITH ClosestExpiry AS (
             ORDER BY ABS(DATEDIFF(day, oc.EXPIRY, oc.DOWNLOAD_DATE))
         ) AS expiry_rank
     FROM optionchain_combined oc
+    JOIN Last3Snapshots l3
+        ON oc.SNAPSHOT_ID = l3.SNAPSHOT_ID
     WHERE oc.TICKER = ?
-        AND oc.SNAPSHOT_ID = ?
 ),
 FilteredExpiry AS (
     SELECT *
@@ -198,8 +206,16 @@ ORDER BY SNAPSHOT_ID, STRIKE
 """
         
         # MySQL query (uses LIMIT and %s parameters, DATEDIFF syntax)
+        # Fetches last 3 snapshots in a single query
         self.query_template_mysql = """
-WITH ClosestExpiry AS (
+WITH Last3Snapshots AS (
+    SELECT DISTINCT SNAPSHOT_ID
+    FROM optionchain_combined
+    WHERE TICKER = %s
+    ORDER BY SNAPSHOT_ID DESC
+    LIMIT 3
+),
+ClosestExpiry AS (
     SELECT
         oc.DOWNLOAD_DATE,
         oc.DOWNLOAD_TIME,
@@ -220,8 +236,9 @@ WITH ClosestExpiry AS (
             ORDER BY ABS(DATEDIFF(oc.EXPIRY, oc.DOWNLOAD_DATE))
         ) AS expiry_rank
     FROM optionchain_combined oc
+    JOIN Last3Snapshots l3
+        ON oc.SNAPSHOT_ID = l3.SNAPSHOT_ID
     WHERE oc.TICKER = %s
-        AND oc.SNAPSHOT_ID = %s
 ),
 FilteredExpiry AS (
     SELECT *
@@ -309,7 +326,7 @@ ORDER BY SNAPSHOT_ID, STRIKE
     
     def get_latest_snapshot_id(self) -> Optional[int]:
         """
-        Get the latest snapshot ID for the ticker.
+        Get the latest snapshot ID for the ticker from optionchain_combined.
         
         Returns:
             Latest snapshot ID or None if no snapshots found
@@ -317,7 +334,7 @@ ORDER BY SNAPSHOT_ID, STRIKE
         if self.db_type == 'mysql':
             query = """
             SELECT SNAPSHOT_ID
-            FROM optionchain_snapshots
+            FROM optionchain_combined
             WHERE TICKER = %s
             ORDER BY SNAPSHOT_ID DESC
             LIMIT 1
@@ -326,7 +343,7 @@ ORDER BY SNAPSHOT_ID, STRIKE
         else:  # SQL Server
             query = """
             SELECT TOP 1 SNAPSHOT_ID
-            FROM optionchain_snapshots
+            FROM optionchain_combined
             WHERE TICKER = ?
             ORDER BY SNAPSHOT_ID DESC
             """
@@ -356,7 +373,7 @@ ORDER BY SNAPSHOT_ID, STRIKE
     
     def get_snapshot_ids(self, limit: int = 3) -> List[int]:
         """
-        Get the last N snapshot IDs for the ticker.
+        Get the last N snapshot IDs for the ticker from optionchain_combined.
         
         Args:
             limit: Number of snapshot IDs to retrieve
@@ -366,8 +383,8 @@ ORDER BY SNAPSHOT_ID, STRIKE
         """
         if self.db_type == 'mysql':
             query = """
-            SELECT SNAPSHOT_ID
-            FROM optionchain_snapshots
+            SELECT DISTINCT SNAPSHOT_ID
+            FROM optionchain_combined
             WHERE TICKER = %s
             ORDER BY SNAPSHOT_ID DESC
             LIMIT %s
@@ -375,8 +392,8 @@ ORDER BY SNAPSHOT_ID, STRIKE
             params = (self.ticker, limit)
         else:  # SQL Server
             query = f"""
-            SELECT TOP {limit} SNAPSHOT_ID
-            FROM optionchain_snapshots
+            SELECT DISTINCT TOP {limit} SNAPSHOT_ID
+            FROM optionchain_combined
             WHERE TICKER = ?
             ORDER BY SNAPSHOT_ID DESC
             """
@@ -427,17 +444,33 @@ ORDER BY SNAPSHOT_ID, STRIKE
 
     def execute_query_for_snapshots(self, snapshot_ids: List[int]) -> List[Dict]:
         """
-        Fetch data for multiple snapshot IDs and return combined rows.
+        Fetch data for last 3 snapshots using a single query.
+        The query automatically gets the last 3 snapshots, so snapshot_ids parameter
+        is kept for compatibility but not used in the query.
         """
-        combined = []
-        for sid in snapshot_ids:
-            rows = self.execute_query_for_snapshot(sid)
-            # tag snapshot id explicitly in case column naming differs
-            for r in rows:
-                r["SNAPSHOT_ID"] = sid
-            combined.extend(rows)
-        logger.info(f"Retrieved {len(combined)} total rows for snapshots {snapshot_ids}")
-        return combined
+        try:
+            conn = self.get_connection()
+            cursor = conn.cursor()
+            # Query automatically gets last 3 snapshots, only needs ticker parameter
+            params = (self.ticker, self.ticker) if self.db_type == 'mysql' else (self.ticker, self.ticker)
+            cursor.execute(self.query_template, params)
+            rows = cursor.fetchall()
+            results = []
+            if self.db_type == 'mysql':
+                results = list(rows)
+            else:
+                columns = [column[0] for column in cursor.description]
+                for row in rows:
+                    result_dict = dict(zip(columns, row))
+                    results.append(result_dict)
+            conn.close()
+            logger.info(f"Retrieved {len(results)} total rows for last 3 snapshots")
+            return results
+        except Exception as e:
+            logger.error(f"Error executing query for snapshots: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
+            return []
     
     def save_results(self, results: List[Dict], snapshot_id: int):
         """
@@ -488,6 +521,60 @@ ORDER BY SNAPSHOT_ID, STRIKE
             
             # Process signals and execute trades
             self.process_signals_and_trades(snapshot_ids, latest_id)
+    
+    def update_portfolio_status(self):
+        """
+        Update portfolio status every minute and push to GitHub.
+        This runs even when there are no new snapshots to keep portfolio value current.
+        """
+        try:
+            from portfolio_manager import PortfolioManager
+            from generate_signal import latest_output_file, load_csv, prepare_data, get_current_ltp
+            from pathlib import Path
+            
+            portfolio = PortfolioManager()
+            open_position = portfolio.get_open_position()
+            
+            if open_position:
+                # Get latest CSV to calculate current LTP
+                try:
+                    output_dir = Path('output')
+                    csv_path = latest_output_file(output_dir)
+                    df_raw = load_csv(csv_path)
+                    df_prep = prepare_data(df_raw)
+                    
+                    current_ltp = get_current_ltp(
+                        df_prep,
+                        open_position['expiry'],
+                        open_position['strike'],
+                        open_position['type']
+                    )
+                    
+                    if current_ltp:
+                        # Update portfolio summary (this triggers git sync)
+                        summary = portfolio.get_portfolio_summary(current_ltp)
+                        logger.info(f"Portfolio Update: Cash={summary['cash']:.2f}, Position={summary['position_value']:.2f}, Total={summary['total_value']:.2f} (Unrealized P&L: {summary['unrealized_pnl']:.2f} ({summary['unrealized_pnl_pct']:.2f}%))")
+                        # Force save to trigger git sync
+                        portfolio._save_portfolio()
+                    else:
+                        # No LTP available, just log cash balance
+                        summary = portfolio.get_portfolio_summary()
+                        logger.info(f"Portfolio Update: Cash={summary['cash']:.2f} (Position LTP unavailable)")
+                        portfolio._save_portfolio()
+                except FileNotFoundError:
+                    # No CSV file yet, just log cash balance
+                    summary = portfolio.get_portfolio_summary()
+                    logger.info(f"Portfolio Update: Cash={summary['cash']:.2f} (No data file available)")
+                    portfolio._save_portfolio()
+                except Exception as e:
+                    logger.debug(f"Error updating portfolio status: {e}")
+            else:
+                # No open position, just log cash balance and sync
+                summary = portfolio.get_portfolio_summary()
+                logger.info(f"Portfolio Update: Cash={summary['cash']:.2f}, Total={summary['total_value']:.2f} (No open position)")
+                portfolio._save_portfolio()
+        except Exception as e:
+            logger.debug(f"Error in portfolio status update: {e}")
     
     def process_signals_and_trades(self, snapshot_ids: List[int], latest_snapshot_id: int):
         """
@@ -714,6 +801,9 @@ ORDER BY SNAPSHOT_ID, STRIKE
                 else:
                     logger.debug(f"No change detected. Current snapshot: {current_snapshot_id}")
                 
+                # Update portfolio status every minute (even without new snapshots)
+                self.update_portfolio_status()
+                
                 # Wait before next check
                 time.sleep(check_interval)
                 
@@ -733,7 +823,7 @@ def main():
     connection_config = get_connection_config()
     
     # Get ticker from environment or use default
-    ticker = os.getenv('TICKER', 'NIFTY50')
+    ticker = os.getenv('TICKER', 'NIFTY')
     
     # Get check interval from environment or use default (60 seconds)
     check_interval = int(os.getenv('CHECK_INTERVAL', '60'))
