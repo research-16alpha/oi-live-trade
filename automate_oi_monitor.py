@@ -705,7 +705,89 @@ ORDER BY SNAPSHOT_ID, STRIKE
         except Exception as e:
             logger.error(f"Error processing signals and trades: {e}", exc_info=True)
     
-    def run(self, check_interval: int = 60):
+    def test_connection(self) -> bool:
+        """
+        Test database connection and query execution.
+        Returns True if all tests pass, False otherwise.
+        """
+        logger.info("=" * 60)
+        logger.info("Testing Database Connection")
+        logger.info("=" * 60)
+        
+        try:
+            logger.info(f"Database Type: {self.db_type}")
+            logger.info(f"Host: {self.config['host']}")
+            logger.info(f"Database: {self.config['database']}")
+            logger.info(f"User: {self.config['user']}")
+            logger.info(f"Ticker: {self.ticker}")
+            
+            # Test connection
+            logger.info("\n1. Testing database connection...")
+            conn = self.get_connection()
+            logger.info("✓ Connection successful!")
+            conn.close()
+            
+            # Test getting latest snapshot ID
+            logger.info("\n2. Testing latest snapshot ID retrieval...")
+            latest_snapshot_id = self.get_latest_snapshot_id()
+            if latest_snapshot_id:
+                logger.info(f"✓ Latest snapshot ID: {latest_snapshot_id}")
+            else:
+                logger.warning("⚠ No snapshots found in database")
+                return False
+            
+            # Test getting last 3 snapshot IDs
+            logger.info("\n3. Testing last 3 snapshot IDs retrieval...")
+            snapshot_ids = self.get_snapshot_ids(limit=3)
+            if snapshot_ids:
+                logger.info(f"✓ Last 3 snapshot IDs: {snapshot_ids}")
+            else:
+                logger.warning("⚠ No snapshot IDs retrieved")
+                return False
+            
+            # Test executing the main query
+            logger.info("\n4. Testing main SQL query execution...")
+            logger.info("   (This may take a few seconds...)")
+            results = self.execute_query_for_snapshots(snapshot_ids)
+            
+            if results:
+                logger.info(f"✓ Query executed successfully!")
+                logger.info(f"✓ Retrieved {len(results)} rows")
+                
+                # Show sample data
+                if len(results) > 0:
+                    logger.info("\n5. Sample data (first row):")
+                    sample = results[0]
+                    for key, value in list(sample.items())[:5]:  # Show first 5 columns
+                        logger.info(f"   {key}: {value}")
+                    logger.info(f"   ... ({len(sample)} total columns)")
+            else:
+                logger.warning("⚠ Query executed but returned no results")
+                return False
+            
+            logger.info("\n" + "=" * 60)
+            logger.info("✓ All tests passed! Database connection is working correctly.")
+            logger.info("=" * 60)
+            return True
+            
+        except ImportError as e:
+            logger.error(f"✗ Import error: {e}")
+            logger.error("Make sure you have activated your virtual environment:")
+            logger.error("  source venv/bin/activate  # Linux/Mac")
+            logger.error("  venv\\Scripts\\activate     # Windows")
+            return False
+        except Exception as e:
+            logger.error(f"✗ Connection test failed: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
+            logger.error("\nTroubleshooting:")
+            logger.error("1. Check your credentials in credentials.sh or credentials.bat")
+            logger.error("2. Make sure you've sourced the credentials: source credentials.sh")
+            logger.error("3. Verify database server is accessible")
+            logger.error("4. Check database user has SELECT privileges")
+            return False
+    
+    def run(self, check_interval: int = 60, test_connection_first: bool = False):
         """
         Main monitoring loop with trading hours enforcement.
         
@@ -713,6 +795,15 @@ ORDER BY SNAPSHOT_ID, STRIKE
             check_interval: Time in seconds between checks (default: 60 seconds)
         """
         check_pytz_installed()
+        
+        # Test connection first if requested
+        if test_connection_first:
+            if not self.test_connection():
+                logger.error("Connection test failed. Exiting.")
+                return
+            logger.info("\n" + "=" * 60)
+            logger.info("Starting monitoring after successful connection test")
+            logger.info("=" * 60 + "\n")
         
         ist_now = get_ist_now()
         logger.info(f"Starting Option Chain Monitor for {self.ticker}")
@@ -817,20 +908,36 @@ ORDER BY SNAPSHOT_ID, STRIKE
 def main():
     """Main entry point."""
     import os
+    import argparse
     from config import get_connection_config
+    
+    parser = argparse.ArgumentParser(description='Automated Option Chain Monitor')
+    parser.add_argument('--test', action='store_true', help='Test database connection before starting monitor')
+    parser.add_argument('--ticker', type=str, default=None, help='Ticker symbol to monitor (default: from env or NIFTY)')
+    parser.add_argument('--interval', type=int, default=None, help='Check interval in seconds (default: 60)')
+    args = parser.parse_args()
     
     # Get connection config from config
     connection_config = get_connection_config()
     
-    # Get ticker from environment or use default
-    ticker = os.getenv('TICKER', 'NIFTY')
+    # Get ticker from args, environment, or use default
+    ticker = args.ticker or os.getenv('TICKER', 'NIFTY')
     
-    # Get check interval from environment or use default (60 seconds)
-    check_interval = int(os.getenv('CHECK_INTERVAL', '60'))
+    # Get check interval from args, environment, or use default (60 seconds)
+    check_interval = args.interval or int(os.getenv('CHECK_INTERVAL', '60'))
     
-    # Create and run monitor
+    # Create monitor
     monitor = OptionChainMonitor(connection_config, ticker=ticker)
-    monitor.run(check_interval=check_interval)
+    
+    # Run connection test if requested
+    if args.test:
+        success = monitor.test_connection()
+        if not success:
+            logger.error("Connection test failed. Exiting.")
+            return
+    
+    # Run monitor
+    monitor.run(check_interval=check_interval, test_connection_first=args.test)
 
 
 if __name__ == '__main__':

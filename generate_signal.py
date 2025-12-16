@@ -77,11 +77,14 @@ def generate_signals(df: pd.DataFrame, strike_step=DEFAULT_STRIKE_STEP, cooldown
         except KeyError:
             continue
         valid_strikes = [atm_strike - strike_step, atm_strike, atm_strike + strike_step]
+        # Check underlying price direction: t2 vs t0 (just needs to change once)
         try:
-            u0, u1, u2 = under_by_snap.loc[t0], under_by_snap.loc[t1], under_by_snap.loc[t2]
-            underlying_falling = (u2 < u1 < u0)
+            u0, u2 = under_by_snap.loc[t0], under_by_snap.loc[t2]
+            underlying_increasing = (u2 > u0)  # For CALL: underlying should increase
+            underlying_decreasing = (u2 < u0)  # For PUT: underlying should decrease
         except KeyError:
-            underlying_falling = False
+            underlying_increasing = False
+            underlying_decreasing = False
 
         for exp in exps_by_snap.loc[t0]:
             for strike in valid_strikes:
@@ -90,23 +93,24 @@ def generate_signals(df: pd.DataFrame, strike_step=DEFAULT_STRIKE_STEP, cooldown
                     continue
                 r0, r1, r2 = df.loc[key0], df.loc[key1], df.loc[key2]
 
-                # CALL ENTRY
+                # CALL ENTRY - requires underlying to increase (t2 > t0)
                 if (
+                    underlying_increasing and
                     r2["c_LTP"] > r1["c_LTP"] > r0["c_LTP"] and
-                    r2["c_LTP"] >= r0["c_LTP"] * 1.03 and
-                    r2["c_OI"] >= r1["c_OI"] * 1.05 and
+                    r2["c_LTP"] >= r0["c_LTP"] * 1.03 and  # 3% price move
+                    r2["c_OI"] >= r1["c_OI"] * 1.02 and   # 2% OI growth
                     r0["c_LTP"] > 5 and
                     t2 - last_call_entry_snap > cooldown
                 ):
                     call_buy_signals[t2] = (exp, strike)
                     last_call_entry_snap = t2
 
-                # PUT ENTRY
+                # PUT ENTRY - requires underlying to decrease (t2 < t0)
                 if (
-                    underlying_falling and
+                    underlying_decreasing and
                     r2["p_LTP"] > r1["p_LTP"] > r0["p_LTP"] and
-                    r2["p_LTP"] >= r0["p_LTP"] * 1.03 and
-                    r2["p_OI"] >= r1["p_OI"] * 1.05 and
+                    r2["p_LTP"] >= r0["p_LTP"] * 1.03 and  # 3% price move
+                    r2["p_OI"] >= r1["p_OI"] * 1.02 and   # 2% OI growth
                     r0["p_LTP"] > 5 and
                     t2 - last_put_entry_snap > cooldown
                 ):

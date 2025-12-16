@@ -41,7 +41,7 @@ def get_connection_config() -> Dict:
     config = {
         'type': db_type,
         'host': os.getenv('DB_SERVER', '34.93.144.87'),
-        'database': os.getenv('DB_DATABASE', 'optionchaindata'),
+        'database': os.getenv('DB_DATABASE', 'optionchaindb'),
         'user': os.getenv('DB_USER', 'lakshay'),
         'password': os.getenv('DB_PASSWORD', '16Alpha!'),
     }

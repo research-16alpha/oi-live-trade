@@ -39,7 +39,23 @@ Then source it:
 source credentials.sh  # On Windows: credentials.bat
 ```
 
-### 3. Run the Monitor
+### 3. Test Connection
+
+```bash
+# Make sure credentials are loaded
+source credentials.sh  # On Windows: credentials.bat
+
+# Run connection test
+python test_connection.py
+```
+
+This will test:
+- Database connection
+- Latest snapshot retrieval
+- SQL query execution
+- Data retrieval
+
+### 4. Run the Monitor
 
 ```bash
 python automate_oi_monitor.py
@@ -51,7 +67,7 @@ The monitor will:
 - Update portfolio every minute (even without new snapshots)
 - Auto-sync portfolio.json to GitHub for Streamlit dashboard
 
-### 4. View Dashboard
+### 5. View Dashboard
 
 Run Streamlit dashboard locally:
 ```bash
