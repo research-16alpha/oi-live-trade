@@ -692,7 +692,7 @@ ORDER BY SNAPSHOT_ID, STRIKE
         
         logger.info(f"Saved {len(results)} rows to {filename}")
     
-    def collect_three_snapshots_timed(self, gap_seconds: int = 180) -> List[int]:
+    def collect_three_snapshots_timed(self, gap_seconds: int = 200) -> List[int]:
         """
         Collect 3 unique snapshot IDs, waiting gap_seconds between fetches.
         This ensures we get snapshots that are approximately 3 minutes apart.
@@ -940,7 +940,7 @@ ORDER BY SNAPSHOT_ID, STRIKE
                         logger.warning(f"SELL signal generated but LTP not available")
                 else:
                     # No exit condition met
-                    logger.debug(f"Position held: {signal_result.get('reason', 'No exit condition')}")
+                    logger.info(f"Position held: {signal_result.get('reason', 'No exit condition')}")
             
             # Evaluate new buy signals (only if no open position)
             if not portfolio.has_open_position():
@@ -951,6 +951,8 @@ ORDER BY SNAPSHOT_ID, STRIKE
                     has_open_position=False,
                     last_buy_snapshot_seq=last_buy_snapshot_seq
                 )
+                
+                logger.info(f"Signal evaluation result: {signal_result}")
                 
                 if signal_result['signal'] in ['BUY_CALL', 'BUY_PUT']:
                     ltp = signal_result.get('ltp')
@@ -977,7 +979,7 @@ ORDER BY SNAPSHOT_ID, STRIKE
                     else:
                         logger.warning(f"BUY signal generated but LTP not available")
                 elif signal_result['signal'] == 'NO_SIGNAL':
-                    logger.debug(f"No signal: {signal_result.get('reason', 'Unknown')}")
+                    logger.info(f"No signal: {signal_result.get('reason', 'Unknown')}")
                     # Log portfolio value even when no signal
                     summary = portfolio.get_portfolio_summary()
                     logger.info(f"Portfolio Value: {summary['total_value']:.2f} (Cash: {summary['cash']:.2f})")
