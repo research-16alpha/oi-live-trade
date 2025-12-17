@@ -104,11 +104,14 @@ def aggregate_to_3min_snapshots(df: pd.DataFrame) -> pd.DataFrame:
 # ---------------------------
 # Signal Generation
 # ---------------------------
-def generate_signals(df: pd.DataFrame, strike_step=DEFAULT_STRIKE_STEP, cooldown=DEFAULT_COOLDOWN):
+def generate_signals(df: pd.DataFrame, strike_step=DEFAULT_STRIKE_STEP, cooldown=DEFAULT_COOLDOWN, debug=False):
     """
     Generate call/put buy signals over the snapshot sequence.
     Now checks all strikes in the dataframe, not just ATM±1.
     """
+    import logging
+    logger = logging.getLogger(__name__)
+    
     call_buy_signals, put_buy_signals = {}, {}
     df_r = df.reset_index()
     snap_list = sorted(df_r["SNAPSHOT_SEQ"].unique())
@@ -117,20 +120,30 @@ def generate_signals(df: pd.DataFrame, strike_step=DEFAULT_STRIKE_STEP, cooldown
     last_call_entry_snap = -9999
     last_put_entry_snap = -9999
 
+    if len(snap_list) < 3:
+        logger.info(f"Not enough snapshots for signal generation: {len(snap_list)} < 3")
+        return call_buy_signals, put_buy_signals
+
+    logger.info(f"Generating signals across {len(snap_list)} snapshots: {snap_list}")
+
     for idx in range(len(snap_list) - 2):
         t0, t1, t2 = snap_list[idx], snap_list[idx + 1], snap_list[idx + 2]
         try:
-            u0, u2 = under_by_snap.loc[t0], under_by_snap.loc[t2]
+            u0, u1, u2 = under_by_snap.loc[t0], under_by_snap.loc[t1], under_by_snap.loc[t2]
             underlying_increasing = (u2 > u0)  # For CALL: underlying should increase
             underlying_decreasing = (u2 < u0)  # For PUT: underlying should decrease
+            logger.info(f"Snapshot sequence {t0}->{t1}->{t2}: Underlying {u0:.2f}->{u1:.2f}->{u2:.2f}, "
+                       f"Increasing={underlying_increasing}, Decreasing={underlying_decreasing}")
         except KeyError:
             underlying_increasing = False
             underlying_decreasing = False
+            logger.warning(f"Missing underlying data for snapshots {t0}, {t1}, or {t2}")
             continue
 
         for exp in exps_by_snap.loc[t0]:
             # Get all available strikes for this expiry at t0
             t0_strikes = df_r[(df_r["SNAPSHOT_SEQ"] == t0) & (df_r["EXPIRY"] == exp)]["STRIKE"].unique()
+            logger.info(f"Checking {len(t0_strikes)} strikes for expiry {exp} across snapshots {t0}->{t1}->{t2}")
             
             for strike in t0_strikes:
                 key0, key1, key2 = (t0, exp, strike), (t1, exp, strike), (t2, exp, strike)
@@ -139,29 +152,78 @@ def generate_signals(df: pd.DataFrame, strike_step=DEFAULT_STRIKE_STEP, cooldown
                 r0, r1, r2 = df.loc[key0], df.loc[key1], df.loc[key2]
 
                 # CALL ENTRY - requires underlying to increase (t2 > t0)
-                if (
-                    underlying_increasing and
-                    r2["c_LTP"] > r1["c_LTP"] > r0["c_LTP"] and
-                    r2["c_LTP"] >= r0["c_LTP"] * 1.03 and  # 3% price move
-                    r2["c_OI"] >= r1["c_OI"] * 1.05 and   # 5% OI growth
-                    r0["c_LTP"] > 5 and
-                    t2 - last_call_entry_snap > cooldown
-                ):
-                    call_buy_signals[t2] = (exp, strike)
-                    last_call_entry_snap = t2
+                if underlying_increasing:
+                    call_conditions = {
+                        "underlying_increasing": underlying_increasing,
+                        "ltp_increasing": r2["c_LTP"] > r1["c_LTP"] > r0["c_LTP"],
+                        "ltp_3pct_move": r2["c_LTP"] >= r0["c_LTP"] * 1.03,
+                        "oi_5pct_growth": r2["c_OI"] >= r1["c_OI"] * 1.05,
+                        "ltp_gt_5": r0["c_LTP"] > 5,
+                        "cooldown_ok": t2 - last_call_entry_snap > cooldown
+                    }
+                    
+                    # Log detailed condition check
+                    ltp_move_pct = ((r2["c_LTP"] / r0["c_LTP"]) - 1) * 100 if r0["c_LTP"] > 0 else 0
+                    oi_growth_pct = ((r2["c_OI"] / r1["c_OI"]) - 1) * 100 if r1["c_OI"] > 0 else 0
+                    
+                    failed_conditions = [k for k, v in call_conditions.items() if not v]
+                    
+                    if failed_conditions:
+                        logger.debug(f"CALL {strike}: FAILED - {failed_conditions}")
+                        logger.debug(f"  LTP: {r0['c_LTP']:.2f}->{r1['c_LTP']:.2f}->{r2['c_LTP']:.2f} "
+                                   f"({ltp_move_pct:.2f}% move, need >=3%)")
+                        logger.debug(f"  OI: {r0['c_OI']:.0f}->{r1['c_OI']:.0f}->{r2['c_OI']:.0f} "
+                                   f"({oi_growth_pct:.2f}% growth t1->t2, need >=5%)")
+                    else:
+                        logger.info(f"CALL {strike}: ALL CONDITIONS MET!")
+                        logger.info(f"  LTP: {r0['c_LTP']:.2f}->{r1['c_LTP']:.2f}->{r2['c_LTP']:.2f} "
+                                  f"({ltp_move_pct:.2f}% move)")
+                        logger.info(f"  OI: {r0['c_OI']:.0f}->{r1['c_OI']:.0f}->{r2['c_OI']:.0f} "
+                                  f"({oi_growth_pct:.2f}% growth t1->t2)")
+                    
+                    if all(call_conditions.values()):
+                        call_buy_signals[t2] = (exp, strike)
+                        last_call_entry_snap = t2
+                        logger.info(f"✓ CALL BUY signal generated at snapshot {t2}: {exp} {strike}, LTP={r2['c_LTP']:.2f}")
 
                 # PUT ENTRY - requires underlying to decrease (t2 < t0)
-                if (
-                    underlying_decreasing and
-                    r2["p_LTP"] > r1["p_LTP"] > r0["p_LTP"] and
-                    r2["p_LTP"] >= r0["p_LTP"] * 1.03 and  # 3% price move
-                    r2["p_OI"] >= r1["p_OI"] * 1.05 and   # 5% OI growth
-                    r0["p_LTP"] > 5 and
-                    t2 - last_put_entry_snap > cooldown
-                ):
-                    put_buy_signals[t2] = (exp, strike)
-                    last_put_entry_snap = t2
+                if underlying_decreasing:
+                    put_conditions = {
+                        "underlying_decreasing": underlying_decreasing,
+                        "ltp_increasing": r2["p_LTP"] > r1["p_LTP"] > r0["p_LTP"],
+                        "ltp_3pct_move": r2["p_LTP"] >= r0["p_LTP"] * 1.03,
+                        "oi_5pct_growth": r2["p_OI"] >= r1["p_OI"] * 1.05,
+                        "ltp_gt_5": r0["p_LTP"] > 5,
+                        "cooldown_ok": t2 - last_put_entry_snap > cooldown
+                    }
+                    
+                    # Log detailed condition check
+                    ltp_move_pct = ((r2["p_LTP"] / r0["p_LTP"]) - 1) * 100 if r0["p_LTP"] > 0 else 0
+                    oi_growth_pct = ((r2["p_OI"] / r1["p_OI"]) - 1) * 100 if r1["p_OI"] > 0 else 0
+                    
+                    failed_conditions = [k for k, v in put_conditions.items() if not v]
+                    
+                    if failed_conditions:
+                        logger.debug(f"PUT {strike}: FAILED - {failed_conditions}")
+                        logger.debug(f"  LTP: {r0['p_LTP']:.2f}->{r1['p_LTP']:.2f}->{r2['p_LTP']:.2f} "
+                                   f"({ltp_move_pct:.2f}% move, need >=3%)")
+                        logger.debug(f"  OI: {r0['p_OI']:.0f}->{r1['p_OI']:.0f}->{r2['p_OI']:.0f} "
+                                   f"({oi_growth_pct:.2f}% growth t1->t2, need >=5%)")
+                    else:
+                        logger.info(f"PUT {strike}: ALL CONDITIONS MET!")
+                        logger.info(f"  LTP: {r0['p_LTP']:.2f}->{r1['p_LTP']:.2f}->{r2['p_LTP']:.2f} "
+                                  f"({ltp_move_pct:.2f}% move)")
+                        logger.info(f"  OI: {r0['p_OI']:.0f}->{r1['p_OI']:.0f}->{r2['p_OI']:.0f} "
+                                  f"({oi_growth_pct:.2f}% growth t1->t2)")
+                    
+                    if all(put_conditions.values()):
+                        put_buy_signals[t2] = (exp, strike)
+                        last_put_entry_snap = t2
+                        logger.info(f"✓ PUT BUY signal generated at snapshot {t2}: {exp} {strike}, LTP={r2['p_LTP']:.2f}")
 
+    if not call_buy_signals and not put_buy_signals:
+        logger.info(f"No signals generated. Checked {len(t0_strikes)} strikes across {len(snap_list)} snapshots")
+    
     return call_buy_signals, put_buy_signals
 
 
@@ -345,7 +407,7 @@ def evaluate_signal(
         if snapshots_since_last_buy <= cooldown:
             return {"signal": "NO_SIGNAL", "reason": f"Cooldown active: {snapshots_since_last_buy}/{cooldown} snapshots since last buy"}
 
-    call_sigs, put_sigs = generate_signals(df)
+    call_sigs, put_sigs = generate_signals(df, debug=True)
 
     if latest_seq in call_sigs:
         exp, strike = call_sigs[latest_seq]
