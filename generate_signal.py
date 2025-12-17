@@ -231,6 +231,19 @@ def generate_signals(df: pd.DataFrame, strike_step=DEFAULT_STRIKE_STEP, cooldown
 
     if not call_buy_signals and not put_buy_signals:
         logger.info(f"No signals generated. Checked {len(t0_strikes)} strikes across {len(snap_list)} snapshots")
+        # Log a summary of why no signals were found
+        if underlying_increasing:
+            logger.info("CALL signals checked but none met all conditions. Common reasons:")
+            logger.info("  - LTP not increasing across all 3 snapshots")
+            logger.info("  - LTP move < 3% (need >= 3%)")
+            logger.info("  - OI growth < 5% from t1->t2 (need >= 5%)")
+            logger.info("  - LTP <= 5 (need > 5)")
+        if underlying_decreasing:
+            logger.info("PUT signals checked but none met all conditions. Common reasons:")
+            logger.info("  - LTP not increasing across all 3 snapshots")
+            logger.info("  - LTP move < 3% (need >= 3%)")
+            logger.info("  - OI growth < 5% from t1->t2 (need >= 5%)")
+            logger.info("  - LTP <= 5 (need > 5)")
     
     return call_buy_signals, put_buy_signals
 
