@@ -107,6 +107,7 @@ def aggregate_to_3min_snapshots(df: pd.DataFrame) -> pd.DataFrame:
 def generate_signals(df: pd.DataFrame, strike_step=DEFAULT_STRIKE_STEP, cooldown=DEFAULT_COOLDOWN):
     """
     Generate call/put buy signals over the snapshot sequence.
+    Now checks all strikes in the dataframe, not just ATM±1.
     """
     call_buy_signals, put_buy_signals = {}, {}
     df_r = df.reset_index()
@@ -119,22 +120,19 @@ def generate_signals(df: pd.DataFrame, strike_step=DEFAULT_STRIKE_STEP, cooldown
     for idx in range(len(snap_list) - 2):
         t0, t1, t2 = snap_list[idx], snap_list[idx + 1], snap_list[idx + 2]
         try:
-            spot = under_by_snap.loc[t0]
-            atm_strike = round(spot / strike_step) * strike_step
-        except KeyError:
-            continue
-        valid_strikes = [atm_strike - strike_step, atm_strike, atm_strike + strike_step]
-        # Check underlying price direction: t2 vs t0 (just needs to change once)
-        try:
             u0, u2 = under_by_snap.loc[t0], under_by_snap.loc[t2]
             underlying_increasing = (u2 > u0)  # For CALL: underlying should increase
             underlying_decreasing = (u2 < u0)  # For PUT: underlying should decrease
         except KeyError:
             underlying_increasing = False
             underlying_decreasing = False
+            continue
 
         for exp in exps_by_snap.loc[t0]:
-            for strike in valid_strikes:
+            # Get all available strikes for this expiry at t0
+            t0_strikes = df_r[(df_r["SNAPSHOT_SEQ"] == t0) & (df_r["EXPIRY"] == exp)]["STRIKE"].unique()
+            
+            for strike in t0_strikes:
                 key0, key1, key2 = (t0, exp, strike), (t1, exp, strike), (t2, exp, strike)
                 if key0 not in df.index or key1 not in df.index or key2 not in df.index:
                     continue
@@ -144,8 +142,8 @@ def generate_signals(df: pd.DataFrame, strike_step=DEFAULT_STRIKE_STEP, cooldown
                 if (
                     underlying_increasing and
                     r2["c_LTP"] > r1["c_LTP"] > r0["c_LTP"] and
-                    r2["c_LTP"] >= r0["c_LTP"] * 1.03 and  # 3% price move (original backtest)
-                    r2["c_OI"] >= r1["c_OI"] * 1.05 and   # 5% OI growth (original backtest)
+                    r2["c_LTP"] >= r0["c_LTP"] * 1.03 and  # 3% price move
+                    r2["c_OI"] >= r1["c_OI"] * 1.05 and   # 5% OI growth
                     r0["c_LTP"] > 5 and
                     t2 - last_call_entry_snap > cooldown
                 ):
@@ -156,8 +154,8 @@ def generate_signals(df: pd.DataFrame, strike_step=DEFAULT_STRIKE_STEP, cooldown
                 if (
                     underlying_decreasing and
                     r2["p_LTP"] > r1["p_LTP"] > r0["p_LTP"] and
-                    r2["p_LTP"] >= r0["p_LTP"] * 1.03 and  # 3% price move (original backtest)
-                    r2["p_OI"] >= r1["p_OI"] * 1.05 and   # 5% OI growth (original backtest)
+                    r2["p_LTP"] >= r0["p_LTP"] * 1.03 and  # 3% price move
+                    r2["p_OI"] >= r1["p_OI"] * 1.05 and   # 5% OI growth
                     r0["p_LTP"] > 5 and
                     t2 - last_put_entry_snap > cooldown
                 ):

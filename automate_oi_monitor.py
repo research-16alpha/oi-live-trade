@@ -416,6 +416,195 @@ ORDER BY SNAPSHOT_ID, STRIKE
             logger.error(f"Error getting snapshot IDs: {e}")
             return []
     
+    def get_strikes_for_snapshot(self, snapshot_id: int) -> tuple:
+        """
+        Get the underlying value and list of strikes (ATM±9) for a given snapshot.
+        
+        Returns:
+            Tuple of (underlying_value, list_of_strikes)
+        """
+        if self.db_type == 'mysql':
+            query = """
+            SELECT DISTINCT UNDERLYING_VALUE, STRIKE
+            FROM optionchain_combined
+            WHERE TICKER = %s AND SNAPSHOT_ID = %s
+            ORDER BY STRIKE
+            """
+            params = (self.ticker, snapshot_id)
+        else:  # SQL Server
+            query = """
+            SELECT DISTINCT UNDERLYING_VALUE, STRIKE
+            FROM optionchain_combined
+            WHERE TICKER = ? AND SNAPSHOT_ID = ?
+            ORDER BY STRIKE
+            """
+            params = (self.ticker, snapshot_id)
+        
+        try:
+            conn = self.get_connection()
+            cursor = conn.cursor()
+            cursor.execute(query, params)
+            rows = cursor.fetchall()
+            conn.close()
+            
+            if not rows:
+                return None, []
+            
+            # Get underlying value (should be same for all rows in a snapshot)
+            if self.db_type == 'mysql':
+                underlying = rows[0]['UNDERLYING_VALUE']
+                strikes = sorted(set(row['STRIKE'] for row in rows))
+            else:
+                underlying = rows[0][0]
+                strikes = sorted(set(row[1] for row in rows))
+            
+            # Find ATM strike (closest to underlying)
+            atm_strike = min(strikes, key=lambda s: abs(s - underlying))
+            atm_index = strikes.index(atm_strike)
+            
+            # Get 9 strikes above and 9 below ATM
+            start_idx = max(0, atm_index - 9)
+            end_idx = min(len(strikes), atm_index + 10)  # +10 to include ATM and 9 above
+            selected_strikes = strikes[start_idx:end_idx]
+            
+            logger.info(f"Snapshot {snapshot_id}: Underlying={underlying}, ATM={atm_strike}, Selected {len(selected_strikes)} strikes")
+            return underlying, selected_strikes
+        except Exception as e:
+            logger.error(f"Error getting strikes for snapshot {snapshot_id}: {e}")
+            return None, []
+    
+    def execute_query_for_fixed_strikes(self, snapshot_ids: List[int], strikes: List[float]) -> List[Dict]:
+        """
+        Fetch data for specific snapshots and specific strikes.
+        This ensures we track the same strikes across all snapshots.
+        """
+        if not snapshot_ids or not strikes:
+            return []
+        
+        # Build strike list for IN clause
+        strikes_str = ','.join(str(s) for s in strikes)
+        
+        if self.db_type == 'mysql':
+            snapshot_ids_str = ','.join(str(sid) for sid in snapshot_ids)
+            query = f"""
+            WITH ClosestExpiry AS (
+                SELECT
+                    oc.DOWNLOAD_DATE,
+                    oc.DOWNLOAD_TIME,
+                    oc.SNAPSHOT_ID,
+                    oc.EXPIRY,
+                    oc.STRIKE,
+                    oc.UNDERLYING_VALUE,
+                    oc.c_OI,
+                    oc.c_CHNG_IN_OI,
+                    oc.c_LTP,
+                    oc.c_VOLUME,
+                    oc.p_OI,
+                    oc.p_CHNG_IN_OI,
+                    oc.p_LTP,
+                    oc.p_VOLUME,
+                    DENSE_RANK() OVER (
+                        PARTITION BY oc.SNAPSHOT_ID
+                        ORDER BY ABS(DATEDIFF(oc.EXPIRY, oc.DOWNLOAD_DATE))
+                    ) AS expiry_rank
+                FROM optionchain_combined oc
+                WHERE oc.TICKER = %s
+                    AND oc.SNAPSHOT_ID IN ({snapshot_ids_str})
+                    AND oc.STRIKE IN ({strikes_str})
+            )
+            SELECT
+                DOWNLOAD_DATE,
+                DOWNLOAD_TIME,
+                SNAPSHOT_ID,
+                EXPIRY,
+                STRIKE,
+                UNDERLYING_VALUE,
+                c_OI,
+                c_CHNG_IN_OI,
+                c_LTP,
+                c_VOLUME,
+                p_OI,
+                p_CHNG_IN_OI,
+                p_LTP,
+                p_VOLUME
+            FROM ClosestExpiry
+            WHERE expiry_rank = 1
+            ORDER BY SNAPSHOT_ID, STRIKE
+            """
+            params = (self.ticker,)
+        else:  # SQL Server
+            # SQL Server needs parameterized queries differently
+            snapshot_placeholders = ','.join('?' * len(snapshot_ids))
+            strike_placeholders = ','.join('?' * len(strikes))
+            query = f"""
+            WITH ClosestExpiry AS (
+                SELECT
+                    oc.DOWNLOAD_DATE,
+                    oc.DOWNLOAD_TIME,
+                    oc.SNAPSHOT_ID,
+                    oc.EXPIRY,
+                    oc.STRIKE,
+                    oc.UNDERLYING_VALUE,
+                    oc.c_OI,
+                    oc.c_CHNG_IN_OI,
+                    oc.c_LTP,
+                    oc.c_VOLUME,
+                    oc.p_OI,
+                    oc.p_CHNG_IN_OI,
+                    oc.p_LTP,
+                    oc.p_VOLUME,
+                    DENSE_RANK() OVER (
+                        PARTITION BY oc.SNAPSHOT_ID
+                        ORDER BY ABS(DATEDIFF(day, oc.EXPIRY, oc.DOWNLOAD_DATE))
+                    ) AS expiry_rank
+                FROM optionchain_combined oc
+                WHERE oc.TICKER = ?
+                    AND oc.SNAPSHOT_ID IN ({snapshot_placeholders})
+                    AND oc.STRIKE IN ({strike_placeholders})
+            )
+            SELECT
+                DOWNLOAD_DATE,
+                DOWNLOAD_TIME,
+                SNAPSHOT_ID,
+                EXPIRY,
+                STRIKE,
+                UNDERLYING_VALUE,
+                c_OI,
+                c_CHNG_IN_OI,
+                c_LTP,
+                c_VOLUME,
+                p_OI,
+                p_CHNG_IN_OI,
+                p_LTP,
+                p_VOLUME
+            FROM ClosestExpiry
+            WHERE expiry_rank = 1
+            ORDER BY SNAPSHOT_ID, STRIKE
+            """
+            params = (self.ticker,) + tuple(snapshot_ids) + tuple(strikes)
+        
+        try:
+            conn = self.get_connection()
+            cursor = conn.cursor()
+            cursor.execute(query, params)
+            rows = cursor.fetchall()
+            results = []
+            if self.db_type == 'mysql':
+                results = list(rows)
+            else:
+                columns = [column[0] for column in cursor.description]
+                for row in rows:
+                    result_dict = dict(zip(columns, row))
+                    results.append(result_dict)
+            conn.close()
+            logger.info(f"Retrieved {len(results)} rows for {len(snapshot_ids)} snapshots with {len(strikes)} fixed strikes")
+            return results
+        except Exception as e:
+            logger.error(f"Error executing query for fixed strikes: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
+            return []
+    
     def execute_query_for_snapshot(self, snapshot_id: int) -> List[Dict]:
         """
         Execute the main query for a specific snapshot ID.
@@ -561,16 +750,29 @@ ORDER BY SNAPSHOT_ID, STRIKE
     def process_snapshots(self, snapshot_ids: List[int]):
         """
         Process multiple snapshots and save their data in a single combined file.
-        Always processes all provided snapshots together - never saves individual snapshots.
+        Now uses fixed strikes from the first snapshot to ensure same strikes across all snapshots.
         """
         if not snapshot_ids:
             logger.warning("No snapshot IDs provided to process.")
             return
+        
         logger.info(f"Processing snapshots (combined): {snapshot_ids}")
-        # Always combine multiple snapshots - never save individual snapshots
-        results = self.execute_query_for_snapshots(snapshot_ids)
+        
+        # Get strikes from the FIRST snapshot (oldest one, which is last in the list)
+        first_snapshot_id = snapshot_ids[-1]  # Oldest snapshot
+        underlying, strikes = self.get_strikes_for_snapshot(first_snapshot_id)
+        
+        if not strikes:
+            logger.warning(f"Could not determine strikes from first snapshot {first_snapshot_id}")
+            return
+        
+        logger.info(f"Using {len(strikes)} fixed strikes from snapshot {first_snapshot_id}: {strikes}")
+        
+        # Query all snapshots with these fixed strikes
+        results = self.execute_query_for_fixed_strikes(snapshot_ids, strikes)
+        
         if results:
-            # use the most recent snapshot id for filename reference
+            # Use the most recent snapshot id for filename reference
             latest_id = snapshot_ids[0]
             self.save_results(results, latest_id)
             
