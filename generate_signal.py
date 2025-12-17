@@ -168,13 +168,17 @@ def generate_signals(df: pd.DataFrame, strike_step=DEFAULT_STRIKE_STEP, cooldown
                     
                     failed_conditions = [k for k, v in call_conditions.items() if not v]
                     
-                    if failed_conditions:
-                        logger.debug(f"CALL {strike}: FAILED - {failed_conditions}")
-                        logger.debug(f"  LTP: {r0['c_LTP']:.2f}->{r1['c_LTP']:.2f}->{r2['c_LTP']:.2f} "
+                    # Only log strikes that are close to meeting conditions (to reduce noise)
+                    # Log if LTP is increasing OR if OI growth is positive (even if not 5%)
+                    should_log = (r2["c_LTP"] > r1["c_LTP"] > r0["c_LTP"]) or (r2["c_OI"] > r1["c_OI"])
+                    
+                    if failed_conditions and should_log:
+                        logger.info(f"CALL {strike}: FAILED - {failed_conditions}")
+                        logger.info(f"  LTP: {r0['c_LTP']:.2f}->{r1['c_LTP']:.2f}->{r2['c_LTP']:.2f} "
                                    f"({ltp_move_pct:.2f}% move, need >=3%)")
-                        logger.debug(f"  OI: {r0['c_OI']:.0f}->{r1['c_OI']:.0f}->{r2['c_OI']:.0f} "
+                        logger.info(f"  OI: {r0['c_OI']:.0f}->{r1['c_OI']:.0f}->{r2['c_OI']:.0f} "
                                    f"({oi_growth_pct:.2f}% growth t1->t2, need >=5%)")
-                    else:
+                    elif not failed_conditions:
                         logger.info(f"CALL {strike}: ALL CONDITIONS MET!")
                         logger.info(f"  LTP: {r0['c_LTP']:.2f}->{r1['c_LTP']:.2f}->{r2['c_LTP']:.2f} "
                                   f"({ltp_move_pct:.2f}% move)")
@@ -203,13 +207,17 @@ def generate_signals(df: pd.DataFrame, strike_step=DEFAULT_STRIKE_STEP, cooldown
                     
                     failed_conditions = [k for k, v in put_conditions.items() if not v]
                     
-                    if failed_conditions:
-                        logger.debug(f"PUT {strike}: FAILED - {failed_conditions}")
-                        logger.debug(f"  LTP: {r0['p_LTP']:.2f}->{r1['p_LTP']:.2f}->{r2['p_LTP']:.2f} "
+                    # Only log strikes that are close to meeting conditions (to reduce noise)
+                    # Log if LTP is increasing OR if OI growth is positive (even if not 5%)
+                    should_log = (r2["p_LTP"] > r1["p_LTP"] > r0["p_LTP"]) or (r2["p_OI"] > r1["p_OI"])
+                    
+                    if failed_conditions and should_log:
+                        logger.info(f"PUT {strike}: FAILED - {failed_conditions}")
+                        logger.info(f"  LTP: {r0['p_LTP']:.2f}->{r1['p_LTP']:.2f}->{r2['p_LTP']:.2f} "
                                    f"({ltp_move_pct:.2f}% move, need >=3%)")
-                        logger.debug(f"  OI: {r0['p_OI']:.0f}->{r1['p_OI']:.0f}->{r2['p_OI']:.0f} "
+                        logger.info(f"  OI: {r0['p_OI']:.0f}->{r1['p_OI']:.0f}->{r2['p_OI']:.0f} "
                                    f"({oi_growth_pct:.2f}% growth t1->t2, need >=5%)")
-                    else:
+                    elif not failed_conditions:
                         logger.info(f"PUT {strike}: ALL CONDITIONS MET!")
                         logger.info(f"  LTP: {r0['p_LTP']:.2f}->{r1['p_LTP']:.2f}->{r2['p_LTP']:.2f} "
                                   f"({ltp_move_pct:.2f}% move)")
