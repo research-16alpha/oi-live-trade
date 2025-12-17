@@ -168,17 +168,35 @@ def generate_signals(df: pd.DataFrame, strike_step=DEFAULT_STRIKE_STEP, cooldown
                     
                     failed_conditions = [k for k, v in call_conditions.items() if not v]
                     
-                    # Only log strikes that are close to meeting conditions (to reduce noise)
-                    # Log if LTP is increasing OR if OI growth is positive (even if not 5%)
-                    should_log = (r2["c_LTP"] > r1["c_LTP"] > r0["c_LTP"]) or (r2["c_OI"] > r1["c_OI"])
-                    
-                    if failed_conditions and should_log:
-                        logger.info(f"CALL {strike}: FAILED - {failed_conditions}")
-                        logger.info(f"  LTP: {r0['c_LTP']:.2f}->{r1['c_LTP']:.2f}->{r2['c_LTP']:.2f} "
-                                   f"({ltp_move_pct:.2f}% move, need >=3%)")
-                        logger.info(f"  OI: {r0['c_OI']:.0f}->{r1['c_OI']:.0f}->{r2['c_OI']:.0f} "
-                                   f"({oi_growth_pct:.2f}% growth t1->t2, need >=5%)")
-                    elif not failed_conditions:
+                    # Log all strikes with detailed failure reasons
+                    if failed_conditions:
+                        logger.info(f"CALL {strike}: FAILED")
+                        # Show specific failure reasons with actual values
+                        if not call_conditions["ltp_increasing"]:
+                            ltp_trend = "increasing" if r2["c_LTP"] > r1["c_LTP"] > r0["c_LTP"] else "NOT increasing"
+                            logger.info(f"  ❌ LTP trend: {ltp_trend} (values: {r0['c_LTP']:.2f}->{r1['c_LTP']:.2f}->{r2['c_LTP']:.2f})")
+                        else:
+                            logger.info(f"  ✓ LTP increasing: {r0['c_LTP']:.2f}->{r1['c_LTP']:.2f}->{r2['c_LTP']:.2f}")
+                        
+                        if not call_conditions["ltp_3pct_move"]:
+                            logger.info(f"  ❌ LTP move: {ltp_move_pct:.2f}% (need >=3%, got {ltp_move_pct:.2f}%)")
+                        else:
+                            logger.info(f"  ✓ LTP move: {ltp_move_pct:.2f}%")
+                        
+                        if not call_conditions["oi_5pct_growth"]:
+                            logger.info(f"  ❌ OI growth t1->t2: {oi_growth_pct:.2f}% (need >=5%, got {oi_growth_pct:.2f}%)")
+                            logger.info(f"     OI values: {r0['c_OI']:.0f}->{r1['c_OI']:.0f}->{r2['c_OI']:.0f}")
+                        else:
+                            logger.info(f"  ✓ OI growth: {oi_growth_pct:.2f}% (OI: {r0['c_OI']:.0f}->{r1['c_OI']:.0f}->{r2['c_OI']:.0f})")
+                        
+                        if not call_conditions["ltp_gt_5"]:
+                            logger.info(f"  ❌ LTP > 5: {r0['c_LTP']:.2f} (need >5)")
+                        else:
+                            logger.info(f"  ✓ LTP > 5: {r0['c_LTP']:.2f}")
+                        
+                        if not call_conditions["cooldown_ok"]:
+                            logger.info(f"  ❌ Cooldown: {t2 - last_call_entry_snap} snapshots since last buy (need >{cooldown})")
+                    else:
                         logger.info(f"CALL {strike}: ALL CONDITIONS MET!")
                         logger.info(f"  LTP: {r0['c_LTP']:.2f}->{r1['c_LTP']:.2f}->{r2['c_LTP']:.2f} "
                                   f"({ltp_move_pct:.2f}% move)")
@@ -207,17 +225,35 @@ def generate_signals(df: pd.DataFrame, strike_step=DEFAULT_STRIKE_STEP, cooldown
                     
                     failed_conditions = [k for k, v in put_conditions.items() if not v]
                     
-                    # Only log strikes that are close to meeting conditions (to reduce noise)
-                    # Log if LTP is increasing OR if OI growth is positive (even if not 5%)
-                    should_log = (r2["p_LTP"] > r1["p_LTP"] > r0["p_LTP"]) or (r2["p_OI"] > r1["p_OI"])
-                    
-                    if failed_conditions and should_log:
-                        logger.info(f"PUT {strike}: FAILED - {failed_conditions}")
-                        logger.info(f"  LTP: {r0['p_LTP']:.2f}->{r1['p_LTP']:.2f}->{r2['p_LTP']:.2f} "
-                                   f"({ltp_move_pct:.2f}% move, need >=3%)")
-                        logger.info(f"  OI: {r0['p_OI']:.0f}->{r1['p_OI']:.0f}->{r2['p_OI']:.0f} "
-                                   f"({oi_growth_pct:.2f}% growth t1->t2, need >=5%)")
-                    elif not failed_conditions:
+                    # Log all strikes with detailed failure reasons
+                    if failed_conditions:
+                        logger.info(f"PUT {strike}: FAILED")
+                        # Show specific failure reasons with actual values
+                        if not put_conditions["ltp_increasing"]:
+                            ltp_trend = "increasing" if r2["p_LTP"] > r1["p_LTP"] > r0["p_LTP"] else "NOT increasing"
+                            logger.info(f"  ❌ LTP trend: {ltp_trend} (values: {r0['p_LTP']:.2f}->{r1['p_LTP']:.2f}->{r2['p_LTP']:.2f})")
+                        else:
+                            logger.info(f"  ✓ LTP increasing: {r0['p_LTP']:.2f}->{r1['p_LTP']:.2f}->{r2['p_LTP']:.2f}")
+                        
+                        if not put_conditions["ltp_3pct_move"]:
+                            logger.info(f"  ❌ LTP move: {ltp_move_pct:.2f}% (need >=3%, got {ltp_move_pct:.2f}%)")
+                        else:
+                            logger.info(f"  ✓ LTP move: {ltp_move_pct:.2f}%")
+                        
+                        if not put_conditions["oi_5pct_growth"]:
+                            logger.info(f"  ❌ OI growth t1->t2: {oi_growth_pct:.2f}% (need >=5%, got {oi_growth_pct:.2f}%)")
+                            logger.info(f"     OI values: {r0['p_OI']:.0f}->{r1['p_OI']:.0f}->{r2['p_OI']:.0f}")
+                        else:
+                            logger.info(f"  ✓ OI growth: {oi_growth_pct:.2f}% (OI: {r0['p_OI']:.0f}->{r1['p_OI']:.0f}->{r2['p_OI']:.0f})")
+                        
+                        if not put_conditions["ltp_gt_5"]:
+                            logger.info(f"  ❌ LTP > 5: {r0['p_LTP']:.2f} (need >5)")
+                        else:
+                            logger.info(f"  ✓ LTP > 5: {r0['p_LTP']:.2f}")
+                        
+                        if not put_conditions["cooldown_ok"]:
+                            logger.info(f"  ❌ Cooldown: {t2 - last_put_entry_snap} snapshots since last buy (need >{cooldown})")
+                    else:
                         logger.info(f"PUT {strike}: ALL CONDITIONS MET!")
                         logger.info(f"  LTP: {r0['p_LTP']:.2f}->{r1['p_LTP']:.2f}->{r2['p_LTP']:.2f} "
                                   f"({ltp_move_pct:.2f}% move)")
