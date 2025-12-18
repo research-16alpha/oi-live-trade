@@ -412,7 +412,15 @@ class PortfolioManager:
         }
         self.portfolio["trade_history"].append(trade)
         
-        self._save_portfolio()
+        # Save portfolio and verify it succeeded
+        save_success = self._save_portfolio()
+        if not save_success:
+            logger.error("CRITICAL: Portfolio save failed after SELL! Trade may be lost.")
+            # Try to reload portfolio to see current state
+            try:
+                self.portfolio = self._load_portfolio()
+            except:
+                pass
         
         logger.info(f"SELL executed: {position['type']} {position['expiry']} {position['strike']} @ {ltp:.2f} = {proceeds:.2f}. P&L: {pnl:.2f} ({pnl_pct:.2f}%). Balance: {balance:.2f} -> {new_balance:.2f}")
         return True, f"Sold {position['type']} {position['expiry']} {position['strike']} @ {ltp:.2f} for {proceeds:.2f}. P&L: {pnl:.2f} ({pnl_pct:.2f}%). New balance: {new_balance:.2f}"
