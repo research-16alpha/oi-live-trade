@@ -808,6 +808,10 @@ ORDER BY SNAPSHOT_ID, STRIKE
                     )
                     
                     if current_ltp:
+                        # Update the open position with current LTP for Streamlit display
+                        open_position['current_ltp'] = current_ltp
+                        open_position['current_ltp_timestamp'] = datetime.now().isoformat()
+                        
                         # Update portfolio summary (this triggers git sync)
                         summary = portfolio.get_portfolio_summary(current_ltp)
                         logger.info(f"Portfolio Update: Cash={summary['cash']:.2f}, Position={summary['position_value']:.2f}, Total={summary['total_value']:.2f} (Unrealized P&L: {summary['unrealized_pnl']:.2f} ({summary['unrealized_pnl_pct']:.2f}%))")

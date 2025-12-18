@@ -50,19 +50,40 @@ def get_current_position_value():
         if not open_position:
             return None, None
         
+        # First try to get current LTP from portfolio.json (updated every minute)
+        current_ltp = open_position.get('current_ltp')
+        ltp_timestamp = open_position.get('current_ltp_timestamp')
+        
+        # If we have a recent LTP in portfolio (within last 2 minutes), use it
+        if current_ltp and ltp_timestamp:
+            try:
+                from datetime import datetime
+                ltp_time = datetime.fromisoformat(ltp_timestamp.replace('Z', '+00:00'))
+                age_seconds = (datetime.now(ltp_time.tzinfo) - ltp_time).total_seconds()
+                if age_seconds < 120:  # Less than 2 minutes old
+                    return open_position, current_ltp
+            except:
+                pass
+        
+        # Fallback: Try to get from CSV files (for local Streamlit or if portfolio LTP is stale)
         output_dir = Path("output")
         csv_files = sorted(output_dir.glob("snapshot_*.csv"), key=lambda p: p.stat().st_mtime, reverse=True)
         if csv_files:
-            df_raw = load_csv(csv_files[0])
-            df_prep = prepare_data(df_raw)
-            current_ltp = get_current_ltp(
-                df_prep,
-                open_position['expiry'],
-                open_position['strike'],
-                open_position['type']
-            )
-            return open_position, current_ltp
-        return open_position, None
+            try:
+                df_raw = load_csv(csv_files[0])
+                df_prep = prepare_data(df_raw)
+                current_ltp = get_current_ltp(
+                    df_prep,
+                    open_position['expiry'],
+                    open_position['strike'],
+                    open_position['type']
+                )
+                return open_position, current_ltp
+            except:
+                pass
+        
+        # Return position with stored LTP even if stale, or None if no LTP available
+        return open_position, current_ltp
     except Exception as e:
         return None, None
 
