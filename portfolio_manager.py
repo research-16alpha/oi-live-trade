@@ -220,6 +220,26 @@ class PortfolioManager:
             if result.returncode == 0:
                 logger.info("Portfolio committed to git")
                 
+                # Pull before pushing to sync with remote and avoid non-fast-forward errors
+                pull_result = subprocess.run(
+                    ['git', 'pull', '--rebase', 'origin', 'main'],
+                    cwd=repo_dir,
+                    capture_output=True,
+                    timeout=30
+                )
+                
+                if pull_result.returncode != 0:
+                    logger.warning(f"Git pull --rebase failed: {pull_result.stderr.decode()}")
+                    # If rebase fails, try regular pull
+                    pull_result = subprocess.run(
+                        ['git', 'pull', 'origin', 'main', '--no-edit'],
+                        cwd=repo_dir,
+                        capture_output=True,
+                        timeout=30
+                    )
+                    if pull_result.returncode != 0:
+                        logger.warning(f"Git pull failed, attempting push anyway: {pull_result.stderr.decode()}")
+                
                 # Push to remote (synchronous - wait for completion)
                 push_result = subprocess.run(
                     ['git', 'push', 'origin', 'main'],
@@ -231,20 +251,26 @@ class PortfolioManager:
                 if push_result.returncode == 0:
                     logger.info("Portfolio pushed to GitHub successfully (Streamlit will update)")
                 else:
-                    logger.warning(f"Git push failed: {push_result.stderr.decode()}")
-                    # Try once more after a short delay
-                    import time
-                    time.sleep(2)
-                    retry_result = subprocess.run(
-                        ['git', 'push', 'origin', 'main'],
-                        cwd=repo_dir,
-                        capture_output=True,
-                        timeout=30
-                    )
-                    if retry_result.returncode == 0:
-                        logger.info("Portfolio pushed to GitHub on retry (Streamlit will update)")
+                    error_msg = push_result.stderr.decode()
+                    logger.error(f"Git push failed: {error_msg}")
+                    
+                    # If it's still a non-fast-forward error after pull, something is wrong
+                    if "non-fast-forward" in error_msg.lower() or "rejected" in error_msg.lower():
+                        logger.error("Git push failed even after pull. This may indicate a conflict that needs manual resolution.")
                     else:
-                        logger.error(f"Git push failed on retry: {retry_result.stderr.decode()}")
+                        # Try once more after a short delay (for other errors)
+                        import time
+                        time.sleep(2)
+                        retry_result = subprocess.run(
+                            ['git', 'push', 'origin', 'main'],
+                            cwd=repo_dir,
+                            capture_output=True,
+                            timeout=30
+                        )
+                        if retry_result.returncode == 0:
+                            logger.info("Portfolio pushed to GitHub on retry (Streamlit will update)")
+                        else:
+                            logger.error(f"Git push failed on retry: {retry_result.stderr.decode()}")
             else:
                 logger.debug(f"Git commit failed (may be no changes): {result.stderr.decode()}")
                 
