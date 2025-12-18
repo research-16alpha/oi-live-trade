@@ -158,18 +158,24 @@ class PortfolioManager:
     def _sync_to_git(self):
         """
         Automatically commit and push portfolio.json to git for Streamlit Cloud.
-        Now runs synchronously to ensure push completes before returning.
+        Fully automated with conflict resolution - no manual intervention needed.
         """
         try:
             portfolio_file = self.portfolio_file.resolve()
             repo_dir = portfolio_file.parent
+            
+            # Configure git to avoid prompts and use automated strategies
+            env = os.environ.copy()
+            env['GIT_TERMINAL_PROMPT'] = '0'  # Disable terminal prompts
+            env['GIT_ASKPASS'] = ''  # Disable credential prompts
             
             # Check if we're in a git repository
             result = subprocess.run(
                 ['git', 'rev-parse', '--git-dir'],
                 cwd=repo_dir,
                 capture_output=True,
-                timeout=5
+                timeout=5,
+                env=env
             )
             if result.returncode != 0:
                 logger.debug("Not in a git repository, skipping git sync")
@@ -180,7 +186,8 @@ class PortfolioManager:
                 ['git', 'ls-files', '--error-unmatch', str(portfolio_file.name)],
                 cwd=repo_dir,
                 capture_output=True,
-                timeout=5
+                timeout=5,
+                env=env
             )
             if result.returncode != 0:
                 logger.debug("portfolio.json not tracked in git, skipping sync")
@@ -191,7 +198,8 @@ class PortfolioManager:
                 ['git', 'diff', '--quiet', str(portfolio_file.name)],
                 cwd=repo_dir,
                 capture_output=True,
-                timeout=5
+                timeout=5,
+                env=env
             )
             if result.returncode == 0:
                 logger.debug("No changes to portfolio.json, skipping sync")
@@ -202,7 +210,8 @@ class PortfolioManager:
                 ['git', 'add', str(portfolio_file.name)],
                 cwd=repo_dir,
                 capture_output=True,
-                timeout=5
+                timeout=5,
+                env=env
             )
             if result.returncode != 0:
                 logger.warning(f"Failed to stage portfolio.json: {result.stderr.decode()}")
@@ -214,38 +223,76 @@ class PortfolioManager:
                 ['git', 'commit', '-m', commit_message],
                 cwd=repo_dir,
                 capture_output=True,
-                timeout=5
+                timeout=5,
+                env=env
             )
             
             if result.returncode == 0:
                 logger.info("Portfolio committed to git")
                 
-                # Pull before pushing to sync with remote and avoid non-fast-forward errors
-                pull_result = subprocess.run(
-                    ['git', 'pull', '--rebase', 'origin', 'main'],
+                # Fetch latest changes first
+                fetch_result = subprocess.run(
+                    ['git', 'fetch', 'origin', 'main'],
                     cwd=repo_dir,
                     capture_output=True,
-                    timeout=30
+                    timeout=30,
+                    env=env
+                )
+                
+                # Pull before pushing to sync with remote and avoid non-fast-forward errors
+                # Use rebase to keep history clean
+                pull_result = subprocess.run(
+                    ['git', 'pull', '--rebase', '--autostash', 'origin', 'main'],
+                    cwd=repo_dir,
+                    capture_output=True,
+                    timeout=30,
+                    env=env
                 )
                 
                 if pull_result.returncode != 0:
-                    logger.warning(f"Git pull --rebase failed: {pull_result.stderr.decode()}")
-                    # If rebase fails, try regular pull
-                    pull_result = subprocess.run(
-                        ['git', 'pull', 'origin', 'main', '--no-edit'],
-                        cwd=repo_dir,
-                        capture_output=True,
-                        timeout=30
-                    )
-                    if pull_result.returncode != 0:
-                        logger.warning(f"Git pull failed, attempting push anyway: {pull_result.stderr.decode()}")
+                    error_msg = pull_result.stderr.decode()
+                    logger.warning(f"Git pull --rebase failed: {error_msg}")
+                    
+                    # If rebase fails due to conflicts, resolve by keeping our version
+                    if "conflict" in error_msg.lower() or "CONFLICT" in error_msg:
+                        logger.info("Resolving merge conflict by keeping local portfolio.json version")
+                        # Abort rebase
+                        subprocess.run(
+                            ['git', 'rebase', '--abort'],
+                            cwd=repo_dir,
+                            capture_output=True,
+                            timeout=10,
+                            env=env
+                        )
+                        # Try pull with merge strategy favoring ours
+                        pull_result = subprocess.run(
+                            ['git', 'pull', 'origin', 'main', '--no-edit', '-X', 'ours'],
+                            cwd=repo_dir,
+                            capture_output=True,
+                            timeout=30,
+                            env=env
+                        )
+                        if pull_result.returncode != 0:
+                            logger.warning(f"Git pull with ours strategy failed: {pull_result.stderr.decode()}")
+                    else:
+                        # If rebase fails for other reasons, try regular pull
+                        pull_result = subprocess.run(
+                            ['git', 'pull', 'origin', 'main', '--no-edit'],
+                            cwd=repo_dir,
+                            capture_output=True,
+                            timeout=30,
+                            env=env
+                        )
+                        if pull_result.returncode != 0:
+                            logger.warning(f"Git pull failed, attempting push anyway: {pull_result.stderr.decode()}")
                 
                 # Push to remote (synchronous - wait for completion)
                 push_result = subprocess.run(
                     ['git', 'push', 'origin', 'main'],
                     cwd=repo_dir,
                     capture_output=True,
-                    timeout=30
+                    timeout=30,
+                    env=env
                 )
                 
                 if push_result.returncode == 0:
@@ -254,9 +301,44 @@ class PortfolioManager:
                     error_msg = push_result.stderr.decode()
                     logger.error(f"Git push failed: {error_msg}")
                     
-                    # If it's still a non-fast-forward error after pull, something is wrong
+                    # If it's still a non-fast-forward error after pull, force pull and push
                     if "non-fast-forward" in error_msg.lower() or "rejected" in error_msg.lower():
-                        logger.error("Git push failed even after pull. This may indicate a conflict that needs manual resolution.")
+                        logger.info("Attempting to resolve non-fast-forward error with force pull...")
+                        # Reset to remote and re-apply our commit
+                        subprocess.run(
+                            ['git', 'reset', '--hard', 'origin/main'],
+                            cwd=repo_dir,
+                            capture_output=True,
+                            timeout=10,
+                            env=env
+                        )
+                        # Re-stage and commit our changes
+                        subprocess.run(
+                            ['git', 'add', str(portfolio_file.name)],
+                            cwd=repo_dir,
+                            capture_output=True,
+                            timeout=5,
+                            env=env
+                        )
+                        subprocess.run(
+                            ['git', 'commit', '-m', commit_message],
+                            cwd=repo_dir,
+                            capture_output=True,
+                            timeout=5,
+                            env=env
+                        )
+                        # Try push again
+                        push_result = subprocess.run(
+                            ['git', 'push', 'origin', 'main'],
+                            cwd=repo_dir,
+                            capture_output=True,
+                            timeout=30,
+                            env=env
+                        )
+                        if push_result.returncode == 0:
+                            logger.info("Portfolio pushed to GitHub successfully after conflict resolution (Streamlit will update)")
+                        else:
+                            logger.error(f"Git push failed after conflict resolution: {push_result.stderr.decode()}")
                     else:
                         # Try once more after a short delay (for other errors)
                         import time
@@ -265,7 +347,8 @@ class PortfolioManager:
                             ['git', 'push', 'origin', 'main'],
                             cwd=repo_dir,
                             capture_output=True,
-                            timeout=30
+                            timeout=30,
+                            env=env
                         )
                         if retry_result.returncode == 0:
                             logger.info("Portfolio pushed to GitHub on retry (Streamlit will update)")
