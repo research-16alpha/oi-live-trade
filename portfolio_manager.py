@@ -38,12 +38,42 @@ class PortfolioManager:
             try:
                 with open(self.portfolio_file, 'r') as f:
                     portfolio = json.load(f)
-                logger.info(f"Loaded portfolio: Balance = {portfolio.get('balance', 0):.2f}")
+                
+                # Validate portfolio structure
+                if not isinstance(portfolio, dict):
+                    raise ValueError("Portfolio file is not a valid JSON object")
+                
+                # Ensure required fields exist
+                if "balance" not in portfolio:
+                    raise ValueError("Portfolio missing 'balance' field")
+                if "positions" not in portfolio:
+                    portfolio["positions"] = []
+                if "trade_history" not in portfolio:
+                    portfolio["trade_history"] = []
+                if "last_buy_snapshot_seq" not in portfolio:
+                    portfolio["last_buy_snapshot_seq"] = -9999
+                
+                logger.info(f"Loaded portfolio: Balance = {portfolio.get('balance', 0):.2f}, "
+                          f"Positions = {len(portfolio.get('positions', []))}, "
+                          f"Trades = {len(portfolio.get('trade_history', []))}")
                 return portfolio
+            except json.JSONDecodeError as e:
+                logger.error(f"Portfolio file is corrupted (invalid JSON): {e}. Attempting backup recovery.")
+                # Try to load backup if exists
+                backup_file = self.portfolio_file.with_suffix('.json.bak')
+                if backup_file.exists():
+                    try:
+                        with open(backup_file, 'r') as f:
+                            portfolio = json.load(f)
+                        logger.warning("Loaded portfolio from backup file")
+                        return portfolio
+                    except:
+                        pass
+                logger.warning("Creating new portfolio after corruption")
             except Exception as e:
-                logger.warning(f"Error loading portfolio file: {e}. Creating new portfolio.")
+                logger.error(f"Error loading portfolio file: {e}. Creating new portfolio.", exc_info=True)
         
-        # Create new portfolio
+        # Create new portfolio only if file doesn't exist or is corrupted
         portfolio = {
             "balance": self.initial_balance,
             "positions": [],
@@ -56,26 +86,54 @@ class PortfolioManager:
         logger.info(f"Created new portfolio with balance: {self.initial_balance:.2f}")
         return portfolio
     
-    def _save_portfolio(self, portfolio: Optional[Dict] = None):
-        """Save portfolio to file."""
+    def _save_portfolio(self, portfolio: Optional[Dict] = None) -> bool:
+        """
+        Save portfolio to file.
+        
+        Returns:
+            True if save was successful, False otherwise
+        """
         if portfolio is None:
             portfolio = self.portfolio
         
         portfolio["last_updated"] = datetime.now().isoformat()
+        
+        # Save to temporary file first, then rename (atomic operation)
+        temp_file = self.portfolio_file.with_suffix('.json.tmp')
         try:
-            with open(self.portfolio_file, 'w') as f:
+            # Write to temporary file
+            with open(temp_file, 'w') as f:
                 json.dump(portfolio, f, indent=2)
+            
+            # Verify the file was written correctly
+            with open(temp_file, 'r') as f:
+                saved_data = json.load(f)
+                if saved_data.get("balance") != portfolio.get("balance"):
+                    raise ValueError("Portfolio data mismatch after save")
+            
+            # Atomic rename (works on Unix and Windows)
+            temp_file.replace(self.portfolio_file)
+            
             logger.info("Portfolio saved successfully")
             
-            # Auto-sync to git for Streamlit Cloud
+            # Auto-sync to git for Streamlit Cloud (synchronous)
             self._sync_to_git()
+            
+            return True
         except Exception as e:
-            logger.error(f"Error saving portfolio: {e}")
+            logger.error(f"Error saving portfolio: {e}", exc_info=True)
+            # Clean up temp file if it exists
+            if temp_file.exists():
+                try:
+                    temp_file.unlink()
+                except:
+                    pass
+            return False
     
     def _sync_to_git(self):
         """
         Automatically commit and push portfolio.json to git for Streamlit Cloud.
-        This runs in the background and doesn't block if git operations fail.
+        Now runs synchronously to ensure push completes before returning.
         """
         try:
             portfolio_file = self.portfolio_file.resolve()
@@ -86,7 +144,7 @@ class PortfolioManager:
                 ['git', 'rev-parse', '--git-dir'],
                 cwd=repo_dir,
                 capture_output=True,
-                timeout=2
+                timeout=5
             )
             if result.returncode != 0:
                 logger.debug("Not in a git repository, skipping git sync")
@@ -97,7 +155,7 @@ class PortfolioManager:
                 ['git', 'ls-files', '--error-unmatch', str(portfolio_file.name)],
                 cwd=repo_dir,
                 capture_output=True,
-                timeout=2
+                timeout=5
             )
             if result.returncode != 0:
                 logger.debug("portfolio.json not tracked in git, skipping sync")
@@ -108,19 +166,22 @@ class PortfolioManager:
                 ['git', 'diff', '--quiet', str(portfolio_file.name)],
                 cwd=repo_dir,
                 capture_output=True,
-                timeout=2
+                timeout=5
             )
             if result.returncode == 0:
                 logger.debug("No changes to portfolio.json, skipping sync")
                 return
             
             # Stage the file
-            subprocess.run(
+            result = subprocess.run(
                 ['git', 'add', str(portfolio_file.name)],
                 cwd=repo_dir,
                 capture_output=True,
-                timeout=2
+                timeout=5
             )
+            if result.returncode != 0:
+                logger.warning(f"Failed to stage portfolio.json: {result.stderr.decode()}")
+                return
             
             # Commit
             commit_message = f"Auto-update portfolio: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
@@ -128,20 +189,37 @@ class PortfolioManager:
                 ['git', 'commit', '-m', commit_message],
                 cwd=repo_dir,
                 capture_output=True,
-                timeout=2
+                timeout=5
             )
             
             if result.returncode == 0:
                 logger.info("Portfolio committed to git")
                 
-                # Push to remote (non-blocking, runs in background)
-                subprocess.Popen(
+                # Push to remote (synchronous - wait for completion)
+                push_result = subprocess.run(
                     ['git', 'push', 'origin', 'main'],
                     cwd=repo_dir,
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL
+                    capture_output=True,
+                    timeout=30
                 )
-                logger.info("Portfolio push initiated to GitHub (Streamlit will update automatically)")
+                
+                if push_result.returncode == 0:
+                    logger.info("Portfolio pushed to GitHub successfully (Streamlit will update)")
+                else:
+                    logger.warning(f"Git push failed: {push_result.stderr.decode()}")
+                    # Try once more after a short delay
+                    import time
+                    time.sleep(2)
+                    retry_result = subprocess.run(
+                        ['git', 'push', 'origin', 'main'],
+                        cwd=repo_dir,
+                        capture_output=True,
+                        timeout=30
+                    )
+                    if retry_result.returncode == 0:
+                        logger.info("Portfolio pushed to GitHub on retry (Streamlit will update)")
+                    else:
+                        logger.error(f"Git push failed on retry: {retry_result.stderr.decode()}")
             else:
                 logger.debug(f"Git commit failed (may be no changes): {result.stderr.decode()}")
                 
@@ -150,7 +228,7 @@ class PortfolioManager:
         except FileNotFoundError:
             logger.debug("Git not found, skipping auto-sync")
         except Exception as e:
-            logger.debug(f"Git sync failed (non-critical): {e}")
+            logger.warning(f"Git sync failed (non-critical): {e}")
     
     def get_balance(self) -> float:
         """Get current portfolio balance."""
@@ -263,7 +341,15 @@ class PortfolioManager:
         }
         self.portfolio["trade_history"].append(trade)
         
-        self._save_portfolio()
+        # Save portfolio and verify it succeeded
+        save_success = self._save_portfolio()
+        if not save_success:
+            logger.error("CRITICAL: Portfolio save failed after BUY! Trade may be lost.")
+            # Try to reload portfolio to see current state
+            try:
+                self.portfolio = self._load_portfolio()
+            except:
+                pass
         
         logger.info(f"BUY executed: {signal_type} {expiry} {strike} @ {ltp:.2f} = {cost:.2f}. Balance: {balance:.2f} -> {new_balance:.2f}")
         return True, f"Bought {signal_type} {expiry} {strike} @ {ltp:.2f} for {cost:.2f}. New balance: {new_balance:.2f}"
