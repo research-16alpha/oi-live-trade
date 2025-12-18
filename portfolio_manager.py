@@ -5,6 +5,7 @@ Tracks portfolio balance and executes buy/sell trades.
 
 import json
 import logging
+import os
 import subprocess
 from datetime import datetime
 from pathlib import Path
