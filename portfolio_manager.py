@@ -32,6 +32,25 @@ class PortfolioManager:
         self.initial_balance = initial_balance
         self.portfolio = self._load_portfolio()
     
+    def _convert_numpy_types(self, obj):
+        """Recursively convert numpy types to Python native types for JSON serialization."""
+        import numpy as np
+        
+        if isinstance(obj, dict):
+            return {key: self._convert_numpy_types(value) for key, value in obj.items()}
+        elif isinstance(obj, list):
+            return [self._convert_numpy_types(item) for item in obj]
+        elif isinstance(obj, (np.integer, np.int64, np.int32, np.int16, np.int8)):
+            return int(obj)
+        elif isinstance(obj, (np.floating, np.float64, np.float32, np.float16)):
+            return float(obj)
+        elif isinstance(obj, np.ndarray):
+            return obj.tolist()
+        elif isinstance(obj, np.bool_):
+            return bool(obj)
+        else:
+            return obj
+    
     def _load_portfolio(self) -> Dict:
         """Load portfolio from file or create new one."""
         if self.portfolio_file.exists():
@@ -96,6 +115,9 @@ class PortfolioManager:
         if portfolio is None:
             portfolio = self.portfolio
         
+        # Convert numpy types to Python native types BEFORE saving
+        portfolio = self._convert_numpy_types(portfolio.copy())
+        
         portfolio["last_updated"] = datetime.now().isoformat()
         
         # Save to temporary file first, then rename (atomic operation)
@@ -108,13 +130,16 @@ class PortfolioManager:
             # Verify the file was written correctly
             with open(temp_file, 'r') as f:
                 saved_data = json.load(f)
-                if saved_data.get("balance") != portfolio.get("balance"):
+                if abs(saved_data.get("balance", 0) - portfolio.get("balance", 0)) > 0.01:
                     raise ValueError("Portfolio data mismatch after save")
             
             # Atomic rename (works on Unix and Windows)
             temp_file.replace(self.portfolio_file)
             
             logger.info("Portfolio saved successfully")
+            
+            # Update in-memory portfolio with converted types
+            self.portfolio = portfolio
             
             # Auto-sync to git for Streamlit Cloud (synchronous)
             self._sync_to_git()
@@ -345,11 +370,14 @@ class PortfolioManager:
         save_success = self._save_portfolio()
         if not save_success:
             logger.error("CRITICAL: Portfolio save failed after BUY! Trade may be lost.")
-            # Try to reload portfolio to see current state
-            try:
-                self.portfolio = self._load_portfolio()
-            except:
-                pass
+            # DON'T reload portfolio - that would overwrite our changes!
+            # Try saving one more time (maybe type conversion will help)
+            logger.warning("Retrying save with explicit type conversion...")
+            save_success = self._save_portfolio()
+            if not save_success:
+                logger.error("CRITICAL: Portfolio save failed on retry! Trade is NOT saved to file.")
+                # Log the portfolio state for debugging
+                logger.error(f"Portfolio state in memory: balance={self.portfolio.get('balance')}, positions={len(self.portfolio.get('positions', []))}")
         
         logger.info(f"BUY executed: {signal_type} {expiry} {strike} @ {ltp:.2f} = {cost:.2f}. Balance: {balance:.2f} -> {new_balance:.2f}")
         return True, f"Bought {signal_type} {expiry} {strike} @ {ltp:.2f} for {cost:.2f}. New balance: {new_balance:.2f}"
