@@ -1,5 +1,5 @@
 {
-  "balance": 116552.5,
+  "balance": 117812.5,
   "positions": [
     {
       "type": "BUY_CALL",
@@ -32,9 +32,16 @@
       "snapshot_id": 9365,
       "snapshot_seq": 2,
       "entry_time": "2025-12-19T11:45:03.813121",
-      "status": "open",
+      "status": "closed",
       "current_ltp": 8.7,
-      "current_ltp_timestamp": "2025-12-19T12:04:01.207067"
+      "current_ltp_timestamp": "2025-12-19T12:04:01.207067",
+      "exit_price": 8.4,
+      "exit_proceeds": 1260.0,
+      "pnl": -127.5,
+      "pnl_pct": -9.18918918918919,
+      "exit_time": "2025-12-19T12:11:04.024368",
+      "exit_snapshot_id": 9416,
+      "exit_snapshot_seq": 2
     }
   ],
   "trade_history": [
@@ -79,10 +86,26 @@
       "snapshot_id": 9365,
       "snapshot_seq": 2,
       "timestamp": "2025-12-19T11:45:03.813129"
+    },
+    {
+      "action": "SELL",
+      "signal_type": "BUY_PUT",
+      "expiry": "2025-12-23",
+      "strike": 25600.0,
+      "entry_price": 9.25,
+      "exit_price": 8.4,
+      "proceeds": 1260.0,
+      "pnl": -127.5,
+      "pnl_pct": -9.18918918918919,
+      "balance_before": 116552.5,
+      "balance_after": 117812.5,
+      "snapshot_id": 9416,
+      "snapshot_seq": 2,
+      "timestamp": "2025-12-19T12:11:04.024376"
     }
   ],
   "last_buy_snapshot_seq": 2,
   "created_at": "2025-12-18T11:34:31.705739",
-  "last_updated": "2025-12-19T12:04:01.207232",
+  "last_updated": "2025-12-19T12:11:04.024469",
   "last_buy_time": "2025-12-19T11:45:03.813127"
 }
