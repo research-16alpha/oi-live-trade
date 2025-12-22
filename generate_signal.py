@@ -21,8 +21,8 @@ import pandas as pd
 DEFAULT_STRIKE_STEP = 50
 # User-specified strategy params
 DEFAULT_STOP_LOSS_PCT = 0.5
-DEFAULT_MIN_HOLD_SNAPS = 7
-DEFAULT_COOLDOWN = 20
+DEFAULT_MIN_HOLD_MINUTES = 20
+DEFAULT_COOLDOWN_MINUTES = 50  # Cooldown period in minutes from first buy
 
 
 # ---------------------------
@@ -104,7 +104,7 @@ def aggregate_to_3min_snapshots(df: pd.DataFrame) -> pd.DataFrame:
 # ---------------------------
 # Signal Generation
 # ---------------------------
-def generate_signals(df: pd.DataFrame, strike_step=DEFAULT_STRIKE_STEP, cooldown=DEFAULT_COOLDOWN, debug=False):
+def generate_signals(df: pd.DataFrame, strike_step=DEFAULT_STRIKE_STEP, cooldown_snapshots=20, debug=False):
     """
     Generate call/put buy signals over the snapshot sequence.
     Now checks all strikes in the dataframe, not just ATM±1.
@@ -157,9 +157,9 @@ def generate_signals(df: pd.DataFrame, strike_step=DEFAULT_STRIKE_STEP, cooldown
                         "underlying_increasing": underlying_increasing,
                         "ltp_increasing": r2["c_LTP"] > r1["c_LTP"] > r0["c_LTP"],
                         "ltp_3pct_move": r2["c_LTP"] >= r0["c_LTP"] * 1.03,
-                        "oi_5pct_growth": r2["c_OI"] >= r1["c_OI"] * 1.05,
+                        "oi_5pct_growth": r2["c_OI"] >= r1["c_OI"],
                         "ltp_gt_5": r0["c_LTP"] > 5,
-                        "cooldown_ok": t2 - last_call_entry_snap > cooldown
+                        "cooldown_ok": t2 - last_call_entry_snap > cooldown_snapshots
                     }
                     
                     # Log detailed condition check
@@ -195,7 +195,7 @@ def generate_signals(df: pd.DataFrame, strike_step=DEFAULT_STRIKE_STEP, cooldown
                             logger.info(f"  ✓ LTP > 5: {r0['c_LTP']:.2f}")
                         
                         if not call_conditions["cooldown_ok"]:
-                            logger.info(f"  ❌ Cooldown: {t2 - last_call_entry_snap} snapshots since last buy (need >{cooldown})")
+                            logger.info(f"  ❌ Cooldown: {t2 - last_call_entry_snap} snapshots since last buy (need >{cooldown_snapshots})")
                     else:
                         logger.info(f"CALL {strike}: ALL CONDITIONS MET!")
                         logger.info(f"  LTP: {r0['c_LTP']:.2f}->{r1['c_LTP']:.2f}->{r2['c_LTP']:.2f} "
@@ -214,9 +214,9 @@ def generate_signals(df: pd.DataFrame, strike_step=DEFAULT_STRIKE_STEP, cooldown
                         "underlying_decreasing": underlying_decreasing,
                         "ltp_increasing": r2["p_LTP"] > r1["p_LTP"] > r0["p_LTP"],
                         "ltp_3pct_move": r2["p_LTP"] >= r0["p_LTP"] * 1.03,
-                        "oi_5pct_growth": r2["p_OI"] >= r1["p_OI"] * 1.05,
+                        "oi_5pct_growth": r2["p_OI"] >= r1["p_OI"],
                         "ltp_gt_5": r0["p_LTP"] > 5,
-                        "cooldown_ok": t2 - last_put_entry_snap > cooldown
+                        "cooldown_ok": t2 - last_put_entry_snap > cooldown_snapshots
                     }
                     
                     # Log detailed condition check
@@ -252,7 +252,7 @@ def generate_signals(df: pd.DataFrame, strike_step=DEFAULT_STRIKE_STEP, cooldown
                             logger.info(f"  ✓ LTP > 5: {r0['p_LTP']:.2f}")
                         
                         if not put_conditions["cooldown_ok"]:
-                            logger.info(f"  ❌ Cooldown: {t2 - last_put_entry_snap} snapshots since last buy (need >{cooldown})")
+                            logger.info(f"  ❌ Cooldown: {t2 - last_put_entry_snap} snapshots since last buy (need >{cooldown_snapshots})")
                     else:
                         logger.info(f"PUT {strike}: ALL CONDITIONS MET!")
                         logger.info(f"  LTP: {r0['p_LTP']:.2f}->{r1['p_LTP']:.2f}->{r2['p_LTP']:.2f} "
@@ -272,13 +272,13 @@ def generate_signals(df: pd.DataFrame, strike_step=DEFAULT_STRIKE_STEP, cooldown
             logger.info("CALL signals checked but none met all conditions. Common reasons:")
             logger.info("  - LTP not increasing across all 3 snapshots")
             logger.info("  - LTP move < 3% (need >= 3%)")
-            logger.info("  - OI growth < 5% from t1->t2 (need >= 5%)")
+            logger.info("  - OI growth < 0% from t1->t2 (need >= 0%)")
             logger.info("  - LTP <= 5 (need > 5)")
         if underlying_decreasing:
             logger.info("PUT signals checked but none met all conditions. Common reasons:")
             logger.info("  - LTP not increasing across all 3 snapshots")
             logger.info("  - LTP move < 3% (need >= 3%)")
-            logger.info("  - OI growth < 5% from t1->t2 (need >= 5%)")
+            logger.info("  - OI growth < 0% from t1->t2 (need >= 0%)")
             logger.info("  - LTP <= 5 (need > 5)")
     
     return call_buy_signals, put_buy_signals
@@ -292,15 +292,16 @@ def evaluate_exit_condition(
     entry_price: float,
     entry_snapshot_seq: int,
     current_snapshot_seq: int,
+    entry_time: str,
     stop_loss_pct: float = DEFAULT_STOP_LOSS_PCT,
-    min_hold_snaps: int = DEFAULT_MIN_HOLD_SNAPS
+    min_hold_minutes: int = DEFAULT_MIN_HOLD_MINUTES
 ) -> Tuple[bool, str, Optional[float]]:
     """
     Evaluate exit conditions for an open position based on backtest logic.
     
     Exit conditions:
     1. Stop loss: curr_ltp <= entry_price * (1 - stop_loss_pct)
-    2. Sell signal: (current_snap - entry_snap) >= min_hold_snaps AND 
+    2. Sell signal: (time since entry) >= min_hold_minutes AND 
                     curr_ltp < prev_ltp AND curr_oi < prev_oi
     
     Args:
@@ -309,10 +310,11 @@ def evaluate_exit_condition(
         position_expiry: Expiry of position
         position_strike: Strike of position
         entry_price: Entry price
-        entry_snapshot_seq: Snapshot sequence when entered
-        current_snapshot_seq: Current snapshot sequence
+        entry_snapshot_seq: Snapshot sequence when entered (legacy, kept for compatibility)
+        current_snapshot_seq: Current snapshot sequence (legacy, kept for compatibility)
+        entry_time: ISO timestamp string of entry time (e.g., "2025-12-18T14:49:36.732818")
         stop_loss_pct: Stop loss percentage (default 0.5 for 50%)
-        min_hold_snaps: Minimum hold snapshots (default 7)
+        min_hold_minutes: Minimum hold time in minutes (default 20)
         
     Returns:
         Tuple of (should_exit, reason, current_ltp)
@@ -345,10 +347,31 @@ def evaluate_exit_condition(
         pnl_pct = ((curr_ltp - entry_price) / entry_price) * 100
         return True, f"Stop loss: {pnl_pct:.2f}%", curr_ltp
     
-    # Check minimum hold period
-    snapshots_held = current_snapshot_seq - entry_snapshot_seq
-    if snapshots_held < min_hold_snaps:
-        return False, f"Minimum hold not met ({snapshots_held}/{min_hold_snaps})", curr_ltp
+    # Check minimum hold period using TIMESTAMPS (20 minutes)
+    time_diff_minutes = 0
+    try:
+        from datetime import datetime
+        entry_dt = datetime.fromisoformat(entry_time.replace('Z', '+00:00'))
+        
+        # Get current snapshot timestamp from dataframe
+        df_r = df.reset_index()
+        current_snap_data = df_r[df_r["SNAPSHOT_SEQ"] == current_snapshot_seq]
+        if not current_snap_data.empty:
+            # Get the first row's timestamp (all rows for same snapshot_seq have same timestamp)
+            current_timestamp = pd.to_datetime(current_snap_data["TIMESTAMP"].iloc[0])
+            entry_timestamp = pd.to_datetime(entry_dt)
+            
+            # Calculate time difference in minutes
+            time_diff_minutes = (current_timestamp - entry_timestamp).total_seconds() / 60
+            
+            if time_diff_minutes < min_hold_minutes:
+                return False, f"Minimum hold not met ({time_diff_minutes:.1f}/{min_hold_minutes} minutes)", curr_ltp
+        else:
+            # Fallback: can't determine time, assume hold period not met
+            return False, "Cannot determine hold time (snapshot not found)", curr_ltp
+    except Exception as e:
+        # Fallback: can't determine time, assume hold period not met
+        return False, f"Cannot determine hold time: {str(e)}", curr_ltp
     
     # Get previous snapshot data for sell signal check
     df_r = df.reset_index()
@@ -378,7 +401,7 @@ def evaluate_exit_condition(
     
     # No exit condition met
     pnl_pct = ((curr_ltp - entry_price) / entry_price) * 100
-    return False, f"Hold: P&L={pnl_pct:.2f}%, Snapshots={snapshots_held}", curr_ltp
+    return False, f"Hold: P&L={pnl_pct:.2f}%, Time={time_diff_minutes:.1f}min", curr_ltp
 
 
 # ---------------------------
@@ -392,8 +415,9 @@ def evaluate_signal(
     position_strike: Optional[float] = None,
     entry_price: Optional[float] = None,
     entry_snapshot_seq: Optional[int] = None,
-    last_buy_snapshot_seq: Optional[int] = None,
-    cooldown: int = DEFAULT_COOLDOWN
+    entry_time: Optional[str] = None,
+    last_buy_time: Optional[str] = None,
+    cooldown_minutes: int = DEFAULT_COOLDOWN_MINUTES
 ) -> Dict:
     """
     Evaluate Buy/Sell/No signal using the last 3 snapshots in the dataframe.
@@ -413,56 +437,80 @@ def evaluate_signal(
 
     latest_seq = snap_seqs[-1]
     
-    # If there's an open position, check for exit conditions
-    if has_open_position and position_type and position_expiry and position_strike and entry_price is not None and entry_snapshot_seq is not None:
-        should_exit, exit_reason, current_ltp = evaluate_exit_condition(
-            df,
-            position_type,
-            position_expiry,
-            position_strike,
-            entry_price,
-            entry_snapshot_seq,
-            latest_seq
-        )
-        
-        if should_exit:
-            # Get snapshot ID
-            try:
-                key = (latest_seq, position_expiry, position_strike)
-                if key in df.index:
-                    row = df.loc[key]
-                    snapshot_id = row.get("SNAPSHOT_ID", None)
-                else:
-                    df_r = df.reset_index()
-                    row = df_r[(df_r["SNAPSHOT_SEQ"] == latest_seq) & 
-                               (df_r["EXPIRY"] == position_expiry) & 
-                               (df_r["STRIKE"] == position_strike)]
-                    snapshot_id = row.iloc[0].get("SNAPSHOT_ID", None) if not row.empty else None
-            except Exception:
-                snapshot_id = None
+    # If there's an open position, ONLY check for exit conditions (sell signals)
+    # Do NOT check for buy signals when position is open
+    if has_open_position:
+        # If we have all required position data, evaluate exit conditions
+        if position_type and position_expiry and position_strike and entry_price is not None and entry_snapshot_seq is not None and entry_time:
+            should_exit, exit_reason, current_ltp = evaluate_exit_condition(
+                df,
+                position_type,
+                position_expiry,
+                position_strike,
+                entry_price,
+                entry_snapshot_seq,
+                latest_seq,
+                entry_time
+            )
             
-            signal_type = "SELL_CALL" if position_type == "BUY_CALL" else "SELL_PUT"
-            return {
-                "signal": signal_type,
-                "snapshot_seq": latest_seq,
-                "expiry": position_expiry,
-                "strike": position_strike,
-                "ltp": current_ltp,
-                "snapshot_id": snapshot_id,
-                "reason": exit_reason
-            }
+            if should_exit:
+                # Get snapshot ID
+                try:
+                    key = (latest_seq, position_expiry, position_strike)
+                    if key in df.index:
+                        row = df.loc[key]
+                        snapshot_id = row.get("SNAPSHOT_ID", None)
+                    else:
+                        df_r = df.reset_index()
+                        row = df_r[(df_r["SNAPSHOT_SEQ"] == latest_seq) & 
+                                   (df_r["EXPIRY"] == position_expiry) & 
+                                   (df_r["STRIKE"] == position_strike)]
+                        snapshot_id = row.iloc[0].get("SNAPSHOT_ID", None) if not row.empty else None
+                except Exception:
+                    snapshot_id = None
+                
+                signal_type = "SELL_CALL" if position_type == "BUY_CALL" else "SELL_PUT"
+                return {
+                    "signal": signal_type,
+                    "snapshot_seq": latest_seq,
+                    "expiry": position_expiry,
+                    "strike": position_strike,
+                    "ltp": current_ltp,
+                    "snapshot_id": snapshot_id,
+                    "reason": exit_reason
+                }
+            else:
+                return {"signal": "NO_SIGNAL", "reason": exit_reason}
         else:
-            return {"signal": "NO_SIGNAL", "reason": exit_reason}
+            # Position is open but missing required data - can't evaluate exit, but still don't check buy signals
+            return {"signal": "NO_SIGNAL", "reason": "Position already open (missing position data)"}
     
     # If no open position, check for buy signals
-    if has_open_position:
-        return {"signal": "NO_SIGNAL", "reason": "Position already open"}
 
-    # Check cooldown from last buy snapshot
-    if last_buy_snapshot_seq is not None:
-        snapshots_since_last_buy = latest_seq - last_buy_snapshot_seq
-        if snapshots_since_last_buy <= cooldown:
-            return {"signal": "NO_SIGNAL", "reason": f"Cooldown active: {snapshots_since_last_buy}/{cooldown} snapshots since last buy"}
+    # Check cooldown from last buy time (time-based)
+    if last_buy_time:
+        try:
+            from datetime import datetime
+            last_buy_dt = datetime.fromisoformat(last_buy_time.replace('Z', '+00:00'))
+            
+            # Get current snapshot timestamp from dataframe
+            df_r = df.reset_index()
+            current_snap_data = df_r[df_r["SNAPSHOT_SEQ"] == latest_seq]
+            if not current_snap_data.empty:
+                current_timestamp = pd.to_datetime(current_snap_data["TIMESTAMP"].iloc[0])
+                last_buy_timestamp = pd.to_datetime(last_buy_dt)
+                
+                # Calculate time difference in minutes
+                minutes_since_last_buy = (current_timestamp - last_buy_timestamp).total_seconds() / 60
+                
+                if minutes_since_last_buy <= cooldown_minutes:
+                    return {"signal": "NO_SIGNAL", "reason": f"Cooldown active: {minutes_since_last_buy:.1f}/{cooldown_minutes} minutes since last buy"}
+            else:
+                # Can't determine time, allow signal generation
+                pass
+        except Exception as e:
+            # If time calculation fails, allow signal generation
+            pass
 
     call_sigs, put_sigs = generate_signals(df, debug=True)
 

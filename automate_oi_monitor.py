@@ -916,7 +916,8 @@ ORDER BY SNAPSHOT_ID, STRIKE
                     position_expiry=open_position['expiry'],
                     position_strike=open_position['strike'],
                     entry_price=open_position['entry_price'],
-                    entry_snapshot_seq=open_position.get('snapshot_seq', 0)
+                    entry_snapshot_seq=open_position.get('snapshot_seq', 0),
+                    entry_time=open_position.get('entry_time')
                 )
                 
                 # Log portfolio value (cash + position value)
@@ -948,12 +949,12 @@ ORDER BY SNAPSHOT_ID, STRIKE
             
             # Evaluate new buy signals (only if no open position)
             if not portfolio.has_open_position():
-                # Get last buy snapshot for cooldown check
-                last_buy_snapshot_seq = portfolio.get_last_buy_snapshot_seq()
+                # Get last buy time for cooldown check (time-based)
+                last_buy_time = portfolio.get_last_buy_time()
                 signal_result = evaluate_signal(
                     df_prep, 
                     has_open_position=False,
-                    last_buy_snapshot_seq=last_buy_snapshot_seq
+                    last_buy_time=last_buy_time
                 )
                 
                 logger.info(f"Signal evaluation result: {signal_result}")
@@ -994,6 +995,225 @@ ORDER BY SNAPSHOT_ID, STRIKE
             logger.warning(f"Portfolio/signal modules not available: {e}")
         except Exception as e:
             logger.error(f"Error processing signals and trades: {e}", exc_info=True)
+    
+    def get_position_ltp_from_db(self, expiry: str, strike: float, signal_type: str) -> Optional[float]:
+        """
+        Fetch current LTP for a specific position directly from the database.
+        Uses the latest snapshot available in the database.
+        
+        Args:
+            expiry: Expiry date string
+            strike: Strike price
+            signal_type: "BUY_CALL" or "BUY_PUT"
+            
+        Returns:
+            Current LTP or None if not found
+        """
+        try:
+            # Get latest snapshot ID
+            latest_snapshot_id = self.get_latest_snapshot_id()
+            if latest_snapshot_id is None:
+                logger.debug("No snapshots available for position LTP fetch")
+                return None
+            
+            # Determine which LTP column to use
+            ltp_column = "c_LTP" if signal_type == "BUY_CALL" else "p_LTP"
+            
+            if self.db_type == 'mysql':
+                query = """
+                WITH ClosestExpiry AS (
+                    SELECT
+                        oc.SNAPSHOT_ID,
+                        oc.DOWNLOAD_DATE,
+                        oc.EXPIRY,
+                        oc.STRIKE,
+                        oc.c_LTP,
+                        oc.p_LTP,
+                        DENSE_RANK() OVER (
+                            PARTITION BY oc.SNAPSHOT_ID
+                            ORDER BY ABS(DATEDIFF(oc.EXPIRY, oc.DOWNLOAD_DATE))
+                        ) AS expiry_rank
+                    FROM optionchain_combined oc
+                    WHERE oc.TICKER = %s
+                        AND oc.SNAPSHOT_ID = %s
+                        AND oc.EXPIRY = %s
+                        AND oc.STRIKE = %s
+                )
+                SELECT {}
+                FROM ClosestExpiry
+                WHERE expiry_rank = 1
+                LIMIT 1
+                """.format(ltp_column)
+                params = (self.ticker, latest_snapshot_id, expiry, strike)
+            else:  # SQL Server
+                query = """
+                WITH ClosestExpiry AS (
+                    SELECT
+                        oc.SNAPSHOT_ID,
+                        oc.DOWNLOAD_DATE,
+                        oc.EXPIRY,
+                        oc.STRIKE,
+                        oc.c_LTP,
+                        oc.p_LTP,
+                        DENSE_RANK() OVER (
+                            PARTITION BY oc.SNAPSHOT_ID
+                            ORDER BY ABS(DATEDIFF(day, oc.EXPIRY, oc.DOWNLOAD_DATE))
+                        ) AS expiry_rank
+                    FROM optionchain_combined oc
+                    WHERE oc.TICKER = ?
+                        AND oc.SNAPSHOT_ID = ?
+                        AND oc.EXPIRY = ?
+                        AND oc.STRIKE = ?
+                )
+                SELECT TOP 1 {}
+                FROM ClosestExpiry
+                WHERE expiry_rank = 1
+                """.format(ltp_column)
+                params = (self.ticker, latest_snapshot_id, expiry, strike)
+            
+            conn = self.get_connection()
+            cursor = conn.cursor()
+            cursor.execute(query, params)
+            row = cursor.fetchone()
+            conn.close()
+            
+            if row:
+                if self.db_type == 'mysql':
+                    ltp = row[ltp_column] if isinstance(row, dict) else row[0]
+                else:
+                    ltp = row[0]
+                
+                if ltp is not None:
+                    logger.debug(f"Fetched position LTP from DB: {ltp} for {signal_type} {expiry} {strike}")
+                    return float(ltp)
+            
+            logger.debug(f"No LTP found in DB for {signal_type} {expiry} {strike}")
+            return None
+            
+        except Exception as e:
+            logger.error(f"Error fetching position LTP from database: {e}")
+            import traceback
+            logger.debug(traceback.format_exc())
+            return None
+
+    def update_position_price(self):
+        """
+        Update open position's price directly from database.
+        Also checks stop loss condition and executes sell if triggered.
+        This runs independently of snapshot collection.
+        """
+        try:
+            from portfolio_manager import PortfolioManager
+            from generate_signal import DEFAULT_STOP_LOSS_PCT
+            
+            portfolio = PortfolioManager()
+            open_position = portfolio.get_open_position()
+            
+            if not open_position:
+                return
+            
+            logger.info(f"Fetching position price update: {open_position['type']} {open_position['expiry']} {open_position['strike']}")
+            
+            # Fetch LTP directly from database
+            current_ltp = self.get_position_ltp_from_db(
+                open_position['expiry'],
+                open_position['strike'],
+                open_position['type']
+            )
+            
+            if current_ltp:
+                entry_price = open_position.get('entry_price')
+                
+                # Check stop loss condition (50% stop loss)
+                if entry_price:
+                    stop_loss_price = entry_price * (1 - DEFAULT_STOP_LOSS_PCT)
+                    
+                    if current_ltp <= stop_loss_price:
+                        pnl_pct = ((current_ltp - entry_price) / entry_price) * 100
+                        logger.warning(f"STOP LOSS TRIGGERED: Current LTP {current_ltp:.2f} <= Stop Loss {stop_loss_price:.2f} (Entry: {entry_price:.2f}, P&L: {pnl_pct:.2f}%)")
+                        
+                        # Execute sell immediately
+                        latest_snapshot_id = self.get_latest_snapshot_id()
+                        if latest_snapshot_id:
+                            success, message = portfolio.sell(
+                                current_ltp,
+                                latest_snapshot_id,
+                                open_position.get('snapshot_seq', 0)
+                            )
+                            if success:
+                                logger.info(f"SELL executed (Stop Loss): {message}")
+                                summary = portfolio.get_portfolio_summary()
+                                logger.info(f"Portfolio Value after sell: {summary['total_value']:.2f} (Cash: {summary['cash']:.2f})")
+                                return  # Exit early after sell
+                            else:
+                                logger.error(f"SELL failed: {message}")
+                        else:
+                            logger.error("Cannot execute sell: No snapshot ID available")
+                
+                # Update the open position with current LTP
+                open_position['current_ltp'] = current_ltp
+                open_position['current_ltp_timestamp'] = datetime.now().isoformat()
+                
+                # Update portfolio summary (this triggers git sync)
+                summary = portfolio.get_portfolio_summary(current_ltp)
+                logger.info(f"Position Price Update: {open_position['type']} {open_position['expiry']} {open_position['strike']} @ {current_ltp:.2f} | Cash={summary['cash']:.2f}, Position={summary['position_value']:.2f}, Total={summary['total_value']:.2f} (Unrealized P&L: {summary['unrealized_pnl']:.2f} ({summary['unrealized_pnl_pct']:.2f}%))")
+                
+                # Force save to trigger git sync
+                portfolio._save_portfolio()
+            else:
+                logger.warning(f"Could not fetch position LTP from database for {open_position['type']} {open_position['expiry']} {open_position['strike']}")
+                
+        except Exception as e:
+            logger.error(f"Error updating position price: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
+    
+    def get_cooldown_remaining_minutes(self) -> Optional[float]:
+        """
+        Calculate remaining cooldown time in minutes.
+        
+        Returns:
+            Remaining cooldown minutes if cooldown is active, None if no cooldown
+        """
+        try:
+            from portfolio_manager import PortfolioManager
+            from generate_signal import DEFAULT_COOLDOWN_MINUTES
+            
+            portfolio = PortfolioManager()
+            last_buy_time = portfolio.get_last_buy_time()
+            
+            if not last_buy_time:
+                return None
+            
+            # Parse last buy time (remove timezone for comparison)
+            try:
+                last_buy_dt = datetime.fromisoformat(last_buy_time.replace('Z', '+00:00'))
+                # Remove timezone info for comparison
+                if last_buy_dt.tzinfo:
+                    last_buy_dt = last_buy_dt.replace(tzinfo=None)
+            except:
+                last_buy_dt = datetime.fromisoformat(last_buy_time)
+            
+            current_dt = get_ist_now()
+            # Remove timezone info from current_dt if present
+            if current_dt.tzinfo:
+                current_dt = current_dt.replace(tzinfo=None)
+            
+            # Calculate time difference in minutes
+            time_diff = current_dt - last_buy_dt
+            minutes_since_last_buy = time_diff.total_seconds() / 60
+            
+            if minutes_since_last_buy >= DEFAULT_COOLDOWN_MINUTES:
+                return None  # Cooldown expired
+            
+            remaining_minutes = DEFAULT_COOLDOWN_MINUTES - minutes_since_last_buy
+            return max(0, remaining_minutes)  # Ensure non-negative
+            
+        except Exception as e:
+            logger.debug(f"Error calculating cooldown: {e}")
+            import traceback
+            logger.debug(traceback.format_exc())
+            return None
     
     def test_connection(self) -> bool:
         """
@@ -1081,6 +1301,12 @@ ORDER BY SNAPSHOT_ID, STRIKE
         """
         Main monitoring loop with trading hours enforcement.
         
+        Logic:
+        - If open position exists: Update position price every 60 seconds, skip snapshot collection
+        - If no open position:
+          - If cooldown active (> 9 minutes remaining): Sleep until cooldown < 9 minutes
+          - If cooldown < 9 minutes or not active: Fetch snapshots normally (3-minute intervals)
+        
         Args:
             check_interval: Time in seconds between checks (default: 60 seconds)
         """
@@ -1120,6 +1346,7 @@ ORDER BY SNAPSHOT_ID, STRIKE
             if open_position:
                 logger.info(f"Resuming with open position: {open_position['type']} {open_position['expiry']} {open_position['strike']}")
                 logger.info(f"Position entered: {open_position.get('entry_time', 'Unknown')}")
+                logger.info("Mode: Position monitoring (updates every 60 seconds, no snapshot collection)")
         except Exception as e:
             logger.debug(f"Could not check portfolio: {e}")
         
@@ -1129,6 +1356,13 @@ ORDER BY SNAPSHOT_ID, STRIKE
             logger.info(f"Initial snapshot ID: {self.last_snapshot_id}")
         else:
             logger.warning("No initial snapshot found. Will check again on next iteration.")
+        
+        # Initialize timers
+        POSITION_UPDATE_INTERVAL = 60  # 1 minute for position updates
+        SNAPSHOT_INTERVAL = 180  # 3 minutes for snapshot collection
+        
+        last_position_update = time.time()
+        last_snapshot_collection = time.time()
         
         try:
             while True:
@@ -1156,39 +1390,105 @@ ORDER BY SNAPSHOT_ID, STRIKE
                         logger.info(f"Outside trading hours. Current time: {ist_now.strftime('%H:%M:%S %Z')}")
                         logger.info("Stopping monitor. Will resume at 9:15 AM IST on next trading day.")
                         break
-                # Check for new snapshot
-                current_snapshot_id = self.get_latest_snapshot_id()
                 
-                if current_snapshot_id is None:
-                    logger.warning("No snapshots found. Waiting...")
+                current_time = time.time()
+                
+                # Check portfolio status
+                try:
+                    from portfolio_manager import PortfolioManager
+                    portfolio = PortfolioManager()
+                    has_position = portfolio.has_open_position()
+                except Exception as e:
+                    logger.error(f"Error checking portfolio: {e}")
                     time.sleep(check_interval)
                     continue
                 
-                # Check if snapshot has changed
-                if current_snapshot_id != self.last_snapshot_id:
-                    logger.info(f"New snapshot detected! Previous: {self.last_snapshot_id}, Current: {current_snapshot_id}")
+                if has_position:
+                    # MODE 1: Open position exists - Update position price every 60 seconds AND run snapshot collection every 3 minutes
                     
-                    # Collect 3 snapshots with 3-minute gaps between them
-                    # This ensures we get snapshots that are approximately 3 minutes apart
-                    snapshot_ids = self.collect_three_snapshots_timed(gap_seconds=180)
+                    # Update position price every 60 seconds
+                    if current_time - last_position_update >= POSITION_UPDATE_INTERVAL:
+                        logger.info("=" * 60)
+                        logger.info("Updating position price (every 60 seconds)")
+                        logger.info("=" * 60)
+                        self.update_position_price()
+                        last_position_update = current_time
                     
-                    if snapshot_ids:
-                        logger.info(f"Collected {len(snapshot_ids)} timed snapshots: {snapshot_ids}")
-                        logger.info("Processing collected snapshots...")
-                        self.process_snapshots(snapshot_ids)
-                    else:
-                        logger.warning("Timed snapshot collection failed or incomplete. Skipping this cycle.")
-                    
-                    # Update last snapshot ID to the most recent one we collected
-                    if snapshot_ids:
-                        self.last_snapshot_id = snapshot_ids[0]
-                    else:
-                        self.last_snapshot_id = current_snapshot_id
+                    # ALSO run snapshot collection every 3 minutes (for sell signal evaluation)
+                    if current_time - last_snapshot_collection >= SNAPSHOT_INTERVAL:
+                        logger.info("=" * 60)
+                        logger.info("Starting scheduled snapshot collection (every 3 minutes) - Checking sell conditions")
+                        logger.info("=" * 60)
+                        
+                        # Collect 3 snapshots with 3-minute gaps between them
+                        snapshot_ids = self.collect_three_snapshots_timed(gap_seconds=180)
+                        
+                        if snapshot_ids:
+                            logger.info(f"Collected {len(snapshot_ids)} timed snapshots: {snapshot_ids}")
+                            logger.info("Processing collected snapshots...")
+                            self.process_snapshots(snapshot_ids)
+                            
+                            # Update last snapshot ID to the most recent one we collected
+                            self.last_snapshot_id = snapshot_ids[0]
+                        else:
+                            logger.warning("Timed snapshot collection failed or incomplete. Skipping this cycle.")
+                        
+                        last_snapshot_collection = current_time
                 else:
-                    logger.debug(f"No change detected. Current snapshot: {current_snapshot_id}")
-                
-                # Update portfolio status every minute (even without new snapshots)
-                self.update_portfolio_status()
+                    # MODE 2: No open position - Check cooldown status
+                    cooldown_remaining = self.get_cooldown_remaining_minutes()
+                    
+                    if cooldown_remaining is not None and cooldown_remaining > 9:
+                        # Cooldown active with > 9 minutes remaining - Sleep until cooldown < 9 minutes
+                        sleep_minutes = cooldown_remaining - 9
+                        sleep_seconds = int(sleep_minutes * 60)
+                        logger.info(f"Cooldown active: {cooldown_remaining:.1f} minutes remaining. Sleeping for {sleep_minutes:.1f} minutes until cooldown < 9 minutes...")
+                        
+                        # Sleep in chunks to allow trading hours check
+                        sleep_chunk = min(sleep_seconds, 60)  # Sleep in 60-second chunks
+                        slept = 0
+                        while slept < sleep_seconds:
+                            time.sleep(sleep_chunk)
+                            slept += sleep_chunk
+                            
+                            # Check trading hours during sleep
+                            if not is_trading_time():
+                                break
+                            
+                            # Recalculate cooldown (in case it changed)
+                            cooldown_remaining = self.get_cooldown_remaining_minutes()
+                            if cooldown_remaining is None or cooldown_remaining <= 9:
+                                break
+                            
+                            remaining_sleep = sleep_seconds - slept
+                            sleep_chunk = min(remaining_sleep, 60)
+                        
+                        logger.info("Cooldown check complete. Proceeding with snapshot collection...")
+                    
+                    # Cooldown < 9 minutes or not active - Fetch snapshots normally
+                    if current_time - last_snapshot_collection >= SNAPSHOT_INTERVAL:
+                        cooldown_status = ""
+                        if cooldown_remaining is not None:
+                            cooldown_status = f" (Cooldown: {cooldown_remaining:.1f} min remaining)"
+                        
+                        logger.info("=" * 60)
+                        logger.info(f"Starting scheduled snapshot collection (every 3 minutes){cooldown_status} - Checking buy conditions")
+                        logger.info("=" * 60)
+                        
+                        # Collect 3 snapshots with 3-minute gaps between them
+                        snapshot_ids = self.collect_three_snapshots_timed(gap_seconds=180)
+                        
+                        if snapshot_ids:
+                            logger.info(f"Collected {len(snapshot_ids)} timed snapshots: {snapshot_ids}")
+                            logger.info("Processing collected snapshots...")
+                            self.process_snapshots(snapshot_ids)
+                            
+                            # Update last snapshot ID to the most recent one we collected
+                            self.last_snapshot_id = snapshot_ids[0]
+                        else:
+                            logger.warning("Timed snapshot collection failed or incomplete. Skipping this cycle.")
+                        
+                        last_snapshot_collection = current_time
                 
                 # Wait before next check
                 time.sleep(check_interval)
