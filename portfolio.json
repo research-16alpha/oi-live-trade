@@ -74,7 +74,9 @@
       "snapshot_id": 10844,
       "snapshot_seq": 2,
       "entry_time": "2025-12-23T14:48:12.155467",
-      "status": "open"
+      "status": "open",
+      "current_ltp": 380.8,
+      "current_ltp_timestamp": "2025-12-23T14:49:12.350253"
     }
   ],
   "trade_history": [
@@ -181,6 +183,6 @@
   ],
   "last_buy_snapshot_seq": 2,
   "created_at": "2025-12-22T13:16:39.008471",
-  "last_updated": "2025-12-23T14:48:12.155476",
+  "last_updated": "2025-12-23T14:49:12.350560",
   "last_buy_time": "2025-12-23T14:48:12.155472"
 }
