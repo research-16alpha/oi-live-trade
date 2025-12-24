@@ -6,6 +6,7 @@ Tracks portfolio balance and executes buy/sell trades.
 import json
 import logging
 import subprocess
+import threading
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, Optional, Tuple
@@ -14,7 +15,8 @@ logger = logging.getLogger(__name__)
 
 PORTFOLIO_FILE = Path("portfolio.json")
 DEFAULT_INITIAL_BALANCE = 100000.0  # Starting balance
-LOT_SIZE = 150  # Number of contracts per trade
+LOT_SIZE = 75  # Number of contracts per lot
+POSITION_SIZE = 15000.0  # Target position size in ₹
 
 
 class PortfolioManager:
@@ -30,6 +32,7 @@ class PortfolioManager:
         """
         self.portfolio_file = portfolio_file
         self.initial_balance = initial_balance
+        self._save_lock = threading.Lock()  # Lock to prevent concurrent saves
         self.portfolio = self._load_portfolio()
     
     def _load_portfolio(self) -> Dict:
@@ -40,10 +43,63 @@ class PortfolioManager:
                     portfolio = json.load(f)
                 logger.info(f"Loaded portfolio: Balance = {portfolio.get('balance', 0):.2f}")
                 return portfolio
+            except json.JSONDecodeError as e:
+                # JSON corruption detected - backup the file before creating new one
+                logger.error(f"CRITICAL: Portfolio file corrupted! JSON error at line {e.lineno}, column {e.colno}: {e.msg}")
+                
+                # Backup corrupted file
+                import shutil
+                backup_file = self.portfolio_file.with_suffix('.json.corrupted')
+                try:
+                    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+                    backup_file = self.portfolio_file.with_suffix(f'.json.corrupted_{timestamp}')
+                    shutil.copy2(self.portfolio_file, backup_file)
+                    logger.error(f"Backed up corrupted file to: {backup_file}")
+                except Exception as backup_error:
+                    logger.error(f"Failed to backup corrupted file: {backup_error}")
+                
+                # Try to recover balance from corrupted file
+                try:
+                    with open(self.portfolio_file, 'r') as f:
+                        content = f.read()
+                    import re
+                    balance_match = re.search(r'"balance"\s*:\s*([\d.]+)', content)
+                    if balance_match:
+                        recovered_balance = float(balance_match.group(1))
+                        logger.warning(f"Recovered balance from corrupted file: {recovered_balance}")
+                        # Create minimal portfolio with recovered balance
+                        portfolio = {
+                            "balance": recovered_balance,
+                            "positions": [],
+                            "trade_history": [],
+                            "last_buy_snapshot_seq": -9999,
+                            "created_at": datetime.now().isoformat(),
+                            "last_updated": datetime.now().isoformat(),
+                            "_recovery_note": f"Recovered from corruption at {datetime.now().isoformat()}. Backup: {str(backup_file)}"
+                        }
+                        logger.error(f"WARNING: Created minimal portfolio with recovered balance. All positions and trade history lost!")
+                        logger.error(f"Please manually restore data from backup: {backup_file}")
+                        return portfolio
+                except Exception as recovery_error:
+                    logger.error(f"Failed to recover data from corrupted file: {recovery_error}")
+                
+                # If recovery failed, create new portfolio but warn heavily
+                logger.error(f"Could not recover data. Creating new portfolio. Check backup: {backup_file}")
             except Exception as e:
-                logger.warning(f"Error loading portfolio file: {e}. Creating new portfolio.")
+                logger.error(f"Error loading portfolio file: {e}")
+                # Backup the file even for non-JSON errors
+                import shutil
+                backup_file = self.portfolio_file.with_suffix('.json.error')
+                try:
+                    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+                    backup_file = self.portfolio_file.with_suffix(f'.json.error_{timestamp}')
+                    shutil.copy2(self.portfolio_file, backup_file)
+                    logger.error(f"Backed up file with error to: {backup_file}")
+                except Exception:
+                    pass
         
-        # Create new portfolio
+        # Create new portfolio (only if file doesn't exist or couldn't be loaded)
+        logger.info("Creating new portfolio (file doesn't exist or couldn't be loaded)")
         portfolio = {
             "balance": self.initial_balance,
             "positions": [],
@@ -56,21 +112,64 @@ class PortfolioManager:
         logger.info(f"Created new portfolio with balance: {self.initial_balance:.2f}")
         return portfolio
     
+    def _convert_numpy_to_python(self, obj):
+        """Recursively convert numpy types to native Python types for JSON serialization."""
+        import numpy as np
+        
+        if isinstance(obj, dict):
+            return {key: self._convert_numpy_to_python(value) for key, value in obj.items()}
+        elif isinstance(obj, (list, tuple)):
+            return [self._convert_numpy_to_python(item) for item in obj]
+        elif isinstance(obj, (np.integer, np.int64, np.int32, np.int16, np.int8)):
+            return int(obj)
+        elif isinstance(obj, (np.floating, np.float64, np.float32, np.float16)):
+            return float(obj)
+        elif isinstance(obj, np.bool_):
+            return bool(obj)
+        elif isinstance(obj, np.ndarray):
+            return obj.tolist()
+        else:
+            return obj
+    
     def _save_portfolio(self, portfolio: Optional[Dict] = None):
-        """Save portfolio to file."""
+        """Save portfolio to file using atomic write and file locking to prevent corruption."""
         if portfolio is None:
             portfolio = self.portfolio
         
         portfolio["last_updated"] = datetime.now().isoformat()
-        try:
-            with open(self.portfolio_file, 'w') as f:
-                json.dump(portfolio, f, indent=2)
-            logger.info("Portfolio saved successfully")
-            
-            # Auto-sync to git for Streamlit Cloud
-            self._sync_to_git()
-        except Exception as e:
-            logger.error(f"Error saving portfolio: {e}")
+        
+        # Convert numpy types to Python types before JSON serialization
+        portfolio = self._convert_numpy_to_python(portfolio)
+        
+        # Use thread lock to prevent concurrent saves from different threads
+        with self._save_lock:
+            try:
+                # Atomic write: write to temp file first, then rename
+                # This prevents corruption if process crashes during write
+                temp_file = self.portfolio_file.with_suffix('.json.tmp')
+                with open(temp_file, 'w') as f:
+                    json.dump(portfolio, f, indent=2)
+                    f.flush()
+                    import os
+                    os.fsync(f.fileno())  # Force write to disk
+                
+                # Atomic rename (this is atomic on most filesystems)
+                # If rename fails, original file is unchanged
+                temp_file.replace(self.portfolio_file)
+                logger.debug("Portfolio saved successfully")
+                
+                # Auto-sync to git for Streamlit Cloud (non-blocking)
+                self._sync_to_git()
+            except Exception as e:
+                logger.error(f"Error saving portfolio: {e}")
+                # Clean up temp file if it exists
+                temp_file = self.portfolio_file.with_suffix('.json.tmp')
+                if temp_file.exists():
+                    try:
+                        temp_file.unlink()
+                    except Exception:
+                        pass
+                raise
     
     def _sync_to_git(self):
         """
@@ -222,7 +321,23 @@ class PortfolioManager:
         if self.has_open_position():
             return False, "Cannot buy: Position already open"
         
-        cost = ltp * LOT_SIZE
+        # Convert numpy types to Python types (values may come from pandas DataFrames)
+        strike = float(strike)
+        ltp = float(ltp)
+        snapshot_id = int(snapshot_id)
+        snapshot_seq = int(snapshot_seq)
+        
+        # Calculate position sizing: target ₹15,000 with lot size of 75
+        cost_per_lot = ltp * LOT_SIZE  # Cost for 1 lot (75 contracts)
+        num_lots = int(POSITION_SIZE / cost_per_lot)  # Number of lots we can buy
+        
+        if num_lots < 1:
+            return False, f"Cannot buy: LTP {ltp:.2f} too high. Need at least ₹{cost_per_lot:.2f} per lot, but position size is ₹{POSITION_SIZE:.2f}"
+        
+        # Calculate actual quantity and cost
+        quantity = num_lots * LOT_SIZE  # Total contracts
+        cost = num_lots * cost_per_lot  # Total cost
+        
         balance = self.get_balance()
         
         if cost > balance:
@@ -238,7 +353,8 @@ class PortfolioManager:
             "strike": strike,
             "entry_price": ltp,
             "entry_cost": cost,
-            "quantity": LOT_SIZE,
+            "quantity": quantity,
+            "num_lots": num_lots,  # Store number of lots for reference
             "snapshot_id": snapshot_id,
             "snapshot_seq": snapshot_seq,
             "entry_time": datetime.now().isoformat(),
@@ -260,6 +376,8 @@ class PortfolioManager:
             "strike": strike,
             "ltp": ltp,
             "cost": cost,
+            "quantity": quantity,
+            "num_lots": num_lots,
             "balance_before": balance,
             "balance_after": new_balance,
             "snapshot_id": snapshot_id,
@@ -270,8 +388,8 @@ class PortfolioManager:
         
         self._save_portfolio()
         
-        logger.info(f"BUY executed: {signal_type} {expiry} {strike} @ {ltp:.2f} = {cost:.2f}. Balance: {balance:.2f} -> {new_balance:.2f}")
-        return True, f"Bought {signal_type} {expiry} {strike} @ {ltp:.2f} for {cost:.2f}. New balance: {new_balance:.2f}"
+        logger.info(f"BUY executed: {signal_type} {expiry} {strike} @ {ltp:.2f} = {cost:.2f} ({num_lots} lots, {quantity} contracts). Balance: {balance:.2f} -> {new_balance:.2f}")
+        return True, f"Bought {signal_type} {expiry} {strike} @ {ltp:.2f} for {cost:.2f} ({num_lots} lots, {quantity} contracts). New balance: {new_balance:.2f}"
     
     def sell(self, ltp: float, snapshot_id: int, snapshot_seq: int) -> Tuple[bool, str]:
         """
@@ -289,8 +407,14 @@ class PortfolioManager:
         if not position:
             return False, "Cannot sell: No open position"
         
-        # Calculate proceeds
-        proceeds = ltp * LOT_SIZE
+        # Convert numpy types to Python types
+        ltp = float(ltp)
+        snapshot_id = int(snapshot_id)
+        snapshot_seq = int(snapshot_seq)
+        
+        # Calculate proceeds using actual position quantity
+        quantity = position.get("quantity", LOT_SIZE)
+        proceeds = ltp * quantity
         balance = self.get_balance()
         new_balance = balance + proceeds
         
@@ -321,6 +445,7 @@ class PortfolioManager:
             "entry_price": position["entry_price"],
             "exit_price": ltp,
             "proceeds": proceeds,
+            "quantity": quantity,
             "pnl": pnl,
             "pnl_pct": pnl_pct,
             "balance_before": balance,
@@ -333,8 +458,9 @@ class PortfolioManager:
         
         self._save_portfolio()
         
-        logger.info(f"SELL executed: {position['type']} {position['expiry']} {position['strike']} @ {ltp:.2f} = {proceeds:.2f}. P&L: {pnl:.2f} ({pnl_pct:.2f}%). Balance: {balance:.2f} -> {new_balance:.2f}")
-        return True, f"Sold {position['type']} {position['expiry']} {position['strike']} @ {ltp:.2f} for {proceeds:.2f}. P&L: {pnl:.2f} ({pnl_pct:.2f}%). New balance: {new_balance:.2f}"
+        num_lots = position.get("num_lots", quantity // LOT_SIZE)
+        logger.info(f"SELL executed: {position['type']} {position['expiry']} {position['strike']} @ {ltp:.2f} = {proceeds:.2f} ({num_lots} lots, {quantity} contracts). P&L: {pnl:.2f} ({pnl_pct:.2f}%). Balance: {balance:.2f} -> {new_balance:.2f}")
+        return True, f"Sold {position['type']} {position['expiry']} {position['strike']} @ {ltp:.2f} for {proceeds:.2f} ({num_lots} lots, {quantity} contracts). P&L: {pnl:.2f} ({pnl_pct:.2f}%). New balance: {new_balance:.2f}"
     
     def get_portfolio_summary(self, current_ltp: Optional[float] = None) -> Dict:
         """

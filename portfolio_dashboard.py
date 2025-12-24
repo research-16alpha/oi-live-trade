@@ -133,10 +133,11 @@ def calculate_portfolio_history(portfolio_data):
     current_balance = portfolio.get_balance()
     
     if open_position and current_ltp:
-        position_value = current_ltp * 150
+        quantity = open_position.get('quantity', 75)  # Use position quantity, default to 75
+        position_value = current_ltp * quantity
         total_value = current_balance + position_value
         entry_price = open_position.get('entry_price', 0)
-        unrealized_pnl = (current_ltp - entry_price) * 150
+        unrealized_pnl = (current_ltp - entry_price) * quantity
         total_pnl = realized_pnl + unrealized_pnl
     else:
         position_value = 0.0
@@ -411,7 +412,7 @@ def main():
                     <strong>Strike:</strong> {open_position['strike']}<br>
                     <strong>Entry Price:</strong> ₹{entry_price:.2f}<br>
                     <strong>Current LTP:</strong> ₹{current_ltp:.2f}<br>
-                    <strong>Quantity:</strong> {open_position.get('quantity', 150)}<br>
+                    <strong>Quantity:</strong> {open_position.get('quantity', 75)}<br>
                     <strong>Entry Time:</strong> {entry_time}<br>
                     <strong class="{pnl_class}">Unrealized P&L:</strong> 
                     <span class="{pnl_class}">₹{unrealized_pnl:,.2f} ({unrealized_pnl_pct:+.2f}%)</span>
