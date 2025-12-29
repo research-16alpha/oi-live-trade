@@ -233,14 +233,26 @@ class PortfolioManager:
             if result.returncode == 0:
                 logger.info("Portfolio committed to git")
                 
-                # Push to remote (non-blocking, runs in background)
-                subprocess.Popen(
-                    ['git', 'push', 'origin', 'main'],
-                    cwd=repo_dir,
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL
-                )
-                logger.info("Portfolio push initiated to GitHub (Streamlit will update automatically)")
+                # Push to remote (blocking to verify success)
+                try:
+                    push_result = subprocess.run(
+                        ['git', 'push', 'origin', 'main'],
+                        cwd=repo_dir,
+                        capture_output=True,
+                        timeout=10,
+                        text=True
+                    )
+                    
+                    if push_result.returncode == 0:
+                        logger.info("Portfolio pushed to GitHub successfully")
+                    else:
+                        logger.error(f"Git push FAILED with return code {push_result.returncode}")
+                        logger.error(f"Git push stderr: {push_result.stderr}")
+                        logger.error(f"Git push stdout: {push_result.stdout}")
+                except subprocess.TimeoutExpired:
+                    logger.error("Git push timed out after 10 seconds")
+                except Exception as e:
+                    logger.error(f"Git push error: {e}")
             else:
                 logger.debug(f"Git commit failed (may be no changes): {result.stderr.decode()}")
                 

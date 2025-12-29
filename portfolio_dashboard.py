@@ -4,6 +4,7 @@ import plotly.express as px
 import plotly.graph_objects as go
 from pathlib import Path
 import json
+import time
 from datetime import datetime
 
 st.set_page_config(
@@ -27,6 +28,7 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
+@st.cache_data(ttl=30)  # Cache for 30 seconds to allow auto-refresh
 def load_portfolio_data():
     """Load portfolio data from JSON file."""
     portfolio_file = Path("portfolio.json")
@@ -179,6 +181,19 @@ def calculate_win_ratio(portfolio_data):
 
 def main():
     st.markdown('<div class="main-header">📈 Option Chain Trading Portfolio Dashboard</div>', unsafe_allow_html=True)
+    
+    # Auto-refresh button and status
+    col_refresh, col_status = st.columns([1, 4])
+    with col_refresh:
+        if st.button("🔄 Refresh", help="Manually refresh portfolio data"):
+            st.cache_data.clear()  # Clear cache to force reload
+            st.rerun()
+    
+    with col_status:
+        portfolio_file = Path("portfolio.json")
+        if portfolio_file.exists():
+            last_modified = datetime.fromtimestamp(portfolio_file.stat().st_mtime)
+            st.caption(f"Last updated: {last_modified.strftime('%Y-%m-%d %H:%M:%S')}")
     
     portfolio_data = load_portfolio_data()
     
