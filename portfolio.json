@@ -229,8 +229,8 @@
       "snapshot_seq": 2,
       "entry_time": "2025-12-30T11:49:22.137919",
       "status": "open",
-      "current_ltp": 71.9,
-      "current_ltp_timestamp": "2025-12-30T11:50:23.828556"
+      "current_ltp": 60.6,
+      "current_ltp_timestamp": "2025-12-30T11:57:25.692746"
     }
   ],
   "trade_history": [
@@ -561,6 +561,6 @@
   ],
   "last_buy_snapshot_seq": 2,
   "created_at": "2025-12-22T13:16:39.008471",
-  "last_updated": "2025-12-30T11:50:23.829036",
+  "last_updated": "2025-12-30T11:57:25.692990",
   "last_buy_time": "2025-12-30T11:49:22.137924"
 }
